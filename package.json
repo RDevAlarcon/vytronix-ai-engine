@@ -1,0 +1,47 @@
+{
+  "name": "vytronix-ai-engine",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev --port 3001",
+    "build": "next build",
+    "start": "next start",
+    "lint": "eslint . --ext .ts,.tsx",
+    "typecheck": "tsc --noEmit",
+    "db:generate": "drizzle-kit generate",
+    "db:migrate": "drizzle-kit migrate",
+    "db:push": "drizzle-kit push",
+    "db:seed": "tsx src/db/seeds/seed.ts",
+    "test:guardrails": "tsx src/testing/guardrail-suite.ts",
+    "test:guardrails:policy": "tsx src/testing/guardrail-policy-check.ts",
+    "docker:up": "docker compose up -d --build",
+    "docker:down": "docker compose down",
+    "docker:dev:up": "docker compose -f docker-compose.dev.yml up -d --build",
+    "docker:dev:down": "docker compose -f docker-compose.dev.yml down"
+  },
+  "dependencies": {
+    "dotenv": "^17.2.3",
+    "drizzle-orm": "^0.44.5",
+    "next": "16.0.10",
+    "postgres": "^3.4.7",
+    "react": "19.2.0",
+    "react-dom": "19.2.0",
+    "zod": "^4.1.12"
+  },
+  "devDependencies": {
+    "@types/node": "^24.9.1",
+    "@types/react": "^19.2.2",
+    "@types/react-dom": "^19.2.2",
+    "autoprefixer": "^10.4.21",
+    "drizzle-kit": "^0.31.7",
+    "eslint": "^9.39.1",
+    "eslint-config-next": "16.0.10",
+    "postcss": "^8.5.6",
+    "tailwindcss": "^3.4.18",
+    "tsx": "^4.20.6",
+    "typescript": "^5.9.3"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}
