@@ -1,6 +1,7 @@
 import Link from "next/link";
 import { notFound } from "next/navigation";
 import { JsonViewer } from "@/components/json-viewer";
+import { RunFeedbackForm } from "@/components/run-feedback-form";
 import { getAgentRunById } from "@/db/repositories/agent-runs.repository";
 
 export const dynamic = "force-dynamic";
@@ -37,6 +38,18 @@ const RunDetailPage = async ({ params }: RunDetailPageProps) => {
           <strong>Status:</strong> {run.status}
         </p>
         <p>
+          <strong>Quality Score:</strong> {typeof run.qualityScore === "number" ? `${run.qualityScore}/100` : "-"}
+        </p>
+        <p>
+          <strong>Quality Flags:</strong> {Array.isArray(run.qualityFlags) ? run.qualityFlags.join(", ") : "-"}
+        </p>
+        <p>
+          <strong>Improvement Signals:</strong> {Array.isArray(run.improvementSignals) ? run.improvementSignals.join(", ") : "-"}
+        </p>
+        <p>
+          <strong>Feedback:</strong> {run.feedbackValue ?? "-"}
+        </p>
+        <p>
           <strong>Model:</strong> {run.model ?? "-"}
         </p>
         <p>
@@ -55,6 +68,12 @@ const RunDetailPage = async ({ params }: RunDetailPageProps) => {
           <strong>Created:</strong> {new Date(run.createdAt).toLocaleString("es-CL")}
         </p>
       </div>
+
+      <RunFeedbackForm
+        runId={run.id}
+        initialFeedbackValue={run.feedbackValue}
+        initialFeedbackComment={run.feedbackComment}
+      />
 
       <div className="space-y-2">
         <h2 className="text-lg font-semibold text-slate-900">Input</h2>

@@ -412,3 +412,27 @@ Si ejecutas la suite de guardrails con API key activa:
 ```bash
 ENGINE_API_KEY=<INTERNAL_API_KEY> npm run test:guardrails -- --timeout-ms 120000
 ```
+
+## Learning Loop Basico
+
+El engine ahora guarda senales de aprendizaje por cada `agent_run`:
+
+- `quality_score`: score automatico 0-100 segun estructura, latencia, reintentos y consistencia minima.
+- `quality_flags`: banderas como `needs_review`, `high_latency`, `missing_required_output`.
+- `improvement_signals`: pistas operativas para ajustar prompts o reglas.
+- `feedback_value`: `helpful` o `unhelpful` desde la UI interna.
+- `feedback_comment`: nota corta opcional del operador.
+
+### Migracion nueva
+
+Antes de usar feedback/scoring en DB, corre:
+
+```bash
+npm run db:migrate
+```
+
+### Feedback interno
+
+- En `Runs` puedes ver score y feedback por ejecucion.
+- En `Run Detail` puedes marcar un resultado como util o no util.
+- En `Dashboard` se muestra promedio de calidad y cola de runs que requieren revision.
