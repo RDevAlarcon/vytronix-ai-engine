@@ -1,13 +1,10 @@
+import { createHash, timingSafeEqual } from "node:crypto";
 import { NextRequest } from "next/server";
 import { env } from "@/lib/env";
 import { AppError } from "@/lib/errors";
+import { InMemoryRateLimiter } from "@/lib/rate-limiter";
 
-type RateLimitEntry = {
-  count: number;
-  windowStart: number;
-};
-
-const rateLimitStore = new Map<string, RateLimitEntry>();
+const rateLimiter = new InMemoryRateLimiter(env.RATE_LIMIT_WINDOW_MS, env.RATE_LIMIT_MAX_REQUESTS);
 
 const getClientIp = (request: NextRequest): string => {
   const forwardedFor = request.headers.get("x-forwarded-for");
@@ -29,10 +26,17 @@ const getClientIp = (request: NextRequest): string => {
 const getRateLimitKey = (request: NextRequest): string => {
   const apiKey = request.headers.get("x-api-key");
   if (apiKey) {
-    return `api_key:${apiKey}`;
+    const fingerprint = createHash("sha256").update(apiKey).digest("hex");
+    return `api_key:${fingerprint}`;
   }
 
   return `ip:${getClientIp(request)}`;
+};
+
+export const isApiKeyValid = (received: string | null, expected: string | undefined): boolean => {
+  const receivedBuffer = received ? Buffer.from(received) : Buffer.alloc(0);
+  const expectedBuffer = expected ? Buffer.from(expected) : Buffer.alloc(0);
+  return receivedBuffer.length === expectedBuffer.length && timingSafeEqual(receivedBuffer, expectedBuffer);
 };
 
 const validateApiKey = (request: NextRequest): void => {
@@ -41,8 +45,8 @@ const validateApiKey = (request: NextRequest): void => {
   }
 
   const received = request.headers.get("x-api-key");
-  const expected = env.INTERNAL_API_KEY;
-  if (!received || !expected || received !== expected) {
+  const expected = env.AI_ENGINE_API_KEY;
+  if (!isApiKeyValid(received, expected)) {
     throw new AppError("Unauthorized", {
       code: "UNAUTHORIZED",
       status: 401
@@ -55,21 +59,8 @@ const applyRateLimit = (request: NextRequest): void => {
     return;
   }
 
-  const now = Date.now();
   const key = getRateLimitKey(request);
-  const current = rateLimitStore.get(key);
-
-  if (!current) {
-    rateLimitStore.set(key, { count: 1, windowStart: now });
-    return;
-  }
-
-  if (now - current.windowStart >= env.RATE_LIMIT_WINDOW_MS) {
-    rateLimitStore.set(key, { count: 1, windowStart: now });
-    return;
-  }
-
-  if (current.count >= env.RATE_LIMIT_MAX_REQUESTS) {
+  if (!rateLimiter.consume(key)) {
     throw new AppError("Too many requests", {
       code: "RATE_LIMITED",
       status: 429,
@@ -80,8 +71,6 @@ const applyRateLimit = (request: NextRequest): void => {
     });
   }
 
-  current.count += 1;
-  rateLimitStore.set(key, current);
 };
 
 export const enforceApiGuard = (request: NextRequest): void => {
@@ -89,3 +78,6 @@ export const enforceApiGuard = (request: NextRequest): void => {
   applyRateLimit(request);
 };
 
+export const resetRateLimitForTests = (): void => {
+  rateLimiter.clear();
+};

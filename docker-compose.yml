@@ -6,7 +6,7 @@ services:
     environment:
       POSTGRES_DB: vytronix_ai_engine
       POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: Ricardo
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
     ports:
       - "5432:5432"
     volumes:
@@ -28,16 +28,28 @@ services:
         condition: service_healthy
     environment:
       NODE_ENV: production
-      DATABASE_URL: postgres://postgres:Ricardo@db:5432/vytronix_ai_engine
-      LLM_PROVIDER: lmstudio
-      LM_STUDIO_BASE_URL: http://host.docker.internal:1234
-      LM_STUDIO_MODEL: qwen2.5-7b-instruct
-      LM_STUDIO_TEMPERATURE: "0.1"
-      LM_STUDIO_MAX_TOKENS: "900"
-      LLM_REQUEST_TIMEOUT_MS: "90000"
+      DATABASE_URL: postgres://postgres:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}@db:5432/vytronix_ai_engine
+      LLM_PROVIDER: ${LLM_PROVIDER:-lmstudio}
+      LM_STUDIO_BASE_URL: ${LM_STUDIO_BASE_URL:-http://host.docker.internal:1234}
+      LM_STUDIO_MODEL: ${LM_STUDIO_MODEL:-qwen2.5-7b-instruct}
+      LM_STUDIO_TEMPERATURE: ${LM_STUDIO_TEMPERATURE:-0.1}
+      LM_STUDIO_MAX_TOKENS: ${LM_STUDIO_MAX_TOKENS:-900}
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-<model-name>}
+      OLLAMA_TEMPERATURE: ${OLLAMA_TEMPERATURE:-0.1}
+      OLLAMA_MAX_TOKENS: ${OLLAMA_MAX_TOKENS:-900}
+      LLM_REQUEST_TIMEOUT_MS: ${LLM_REQUEST_TIMEOUT_MS:-90000}
+      API_KEY_REQUIRED: "true"
+      AI_ENGINE_API_KEY: ${AI_ENGINE_API_KEY:?AI_ENGINE_API_KEY is required}
     ports:
       - "3001:3000"
-    command: sh -c "npm run db:migrate && npm run start"
+    command: ["npm", "run", "start"]
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "--quiet", "http://127.0.0.1:3000/api/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
     extra_hosts:
       - "host.docker.internal:host-gateway"
 

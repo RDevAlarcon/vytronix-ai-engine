@@ -1,11 +1,14 @@
 import { NextResponse } from "next/server";
 import { llmService } from "@/ai/llm/llm.service";
-import { toErrorMessage } from "@/lib/errors";
+import { AppError, toPublicError } from "@/lib/errors";
+import { enforceApiGuard } from "@/lib/api-guard";
+import { NextRequest } from "next/server";
 
 export const runtime = "nodejs";
 
-export async function GET() {
+export async function GET(request: NextRequest) {
   try {
+    enforceApiGuard(request);
     const result = await llmService.chat({
       messages: [
         {
@@ -31,10 +34,9 @@ export async function GET() {
     return NextResponse.json(
       {
         status: "error",
-        message: "LLM connection test failed",
-        details: toErrorMessage(error)
+        error: toPublicError(error)
       },
-      { status: 503 }
+      { status: error instanceof AppError ? error.status : 503 }
     );
   }
 }

@@ -7,16 +7,13 @@ export const runtime = "nodejs";
 export async function GET() {
   const dbHealthy = await checkDatabaseHealth();
 
+  const llmConfigured = env.LLM_PROVIDER === "lmstudio"
+    ? Boolean(env.LM_STUDIO.baseUrl && env.LM_STUDIO.model)
+    : Boolean(env.OLLAMA.baseUrl && env.OLLAMA.model);
   return NextResponse.json({
-    status: dbHealthy ? "ok" : "degraded",
-    checks: {
-      database: dbHealthy ? "ok" : "error",
-      llm: {
-        provider: env.LLM_PROVIDER,
-        baseUrl: env.LM_STUDIO_BASE_URL,
-        model: env.LM_STUDIO_MODEL
-      }
-    },
-    timestamp: new Date().toISOString()
-  });
+    status: dbHealthy && llmConfigured ? "ok" : "degraded",
+    service: "ai-engine",
+    database: dbHealthy ? "ok" : "error",
+    llm: llmConfigured ? "ok" : "error"
+  }, { status: dbHealthy && llmConfigured ? 200 : 503 });
 }

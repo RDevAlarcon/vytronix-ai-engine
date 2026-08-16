@@ -241,6 +241,13 @@ const supportIncidentSignals = [
   "soporte"
 ];
 
+const hardOutOfScopeSignals: Record<AgentName, string[]> = {
+  lead: ["reparar el motor", "motor de mi automovil", "motor de mi automóvil", "reparacion de automovil"],
+  landing: ["demanda laboral", "estrategia legal", "juicio laboral", "abogado", "defensa legal"],
+  proposal: ["diagnostico medico", "dosis exacta", "tratamiento de emergencia", "receta medica", "diagnostico clinico"],
+  support: ["landing page", "secciones y cta", "disenes una landing", "diseñes una landing", "generar leads"]
+};
+
 export const classifyAgentScope = (agent: AgentName, input: unknown): ClassificationResult => {
   const rootRecord = asRecord(input);
   const text = collectText(input).join(" ");
@@ -258,6 +265,15 @@ export const classifyAgentScope = (agent: AgentName, input: unknown): Classifica
       inScope: false,
       confidence: 1,
       reason: `global_unsafe_hits=${unsafeHits}`
+    };
+  }
+
+  const hardOutOfScopeHits = countMatches(text, hardOutOfScopeSignals[agent]);
+  if (hardOutOfScopeHits > 0) {
+    return {
+      inScope: false,
+      confidence: 1,
+      reason: `hard_out_of_scope_hits=${hardOutOfScopeHits}`
     };
   }
 

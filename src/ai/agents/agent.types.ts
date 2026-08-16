@@ -1,5 +1,6 @@
 import { z } from "zod";
 import type { ChatMessage } from "@/ai/llm/llm.types";
+import type { StructuredOutputDiagnostic } from "@/ai/structured-output/structured-output";
 
 export type AgentName = "lead" | "landing" | "proposal" | "support";
 export type AgentExecutionMode = "standard" | "fast";
@@ -36,5 +37,7 @@ export type AgentRunResult<TOutput = unknown> = {
     totalTokens?: number;
   };
   attemptCount: number;
+  repairAttempt?: boolean;
+  diagnostics?: StructuredOutputDiagnostic[];
   durationMs: number;
 };

@@ -1,5 +1,7 @@
 # vytronix-ai-engine
 
+> Vytronix AI Engine v1 — frozen baseline. Current benchmark candidate: Ollama + `phi4-mini`. Provider and model remain configurable.
+
 Motor interno de agentes IA de Vytronix, separado del sitio principal (`vytronix.cl`), diseñado para correr local-first con LM Studio y preparado para despliegue futuro en Railway/Vercel.
 
 ## Por qué es un proyecto separado
@@ -74,7 +76,7 @@ Usa `.env.example` como base:
 
 ```env
 NODE_ENV=development
-DATABASE_URL=postgres://postgres:postgres@127.0.0.1:5432/vytronix_ai_engine
+DATABASE_URL=postgres://postgres:change-me@127.0.0.1:5433/vytronix_ai_engine
 
 LLM_PROVIDER=lmstudio
 LM_STUDIO_BASE_URL=http://127.0.0.1:1234
@@ -83,7 +85,7 @@ LM_STUDIO_TEMPERATURE=0.2
 LM_STUDIO_MAX_TOKENS=900
 LLM_REQUEST_TIMEOUT_MS=90000
 API_KEY_REQUIRED=false
-INTERNAL_API_KEY=replace-with-very-long-random-key
+AI_ENGINE_API_KEY=replace-with-a-long-random-key
 RATE_LIMIT_ENABLED=true
 RATE_LIMIT_WINDOW_MS=60000
 RATE_LIMIT_MAX_REQUESTS=60
@@ -244,7 +246,7 @@ Body:
 Header opcional/requerido (según `API_KEY_REQUIRED`):
 
 ```http
-X-API-Key: <INTERNAL_API_KEY>
+X-API-Key: <AI_ENGINE_API_KEY>
 ```
 
 `mode` soportado:
@@ -436,3 +438,35 @@ npm run db:migrate
 - En `Runs` puedes ver score y feedback por ejecucion.
 - En `Run Detail` puedes marcar un resultado como util o no util.
 - En `Dashboard` se muestra promedio de calidad y cola de runs que requieren revision.
+
+## Proveedores LLM
+
+El proveedor activo se selecciona con `LLM_PROVIDER=lmstudio` u
+`LLM_PROVIDER=ollama`. LM Studio mantiene sus variables existentes. Ollama
+usa su endpoint OpenAI-compatible y requiere `OLLAMA_BASE_URL` y
+`OLLAMA_MODEL`; no se descargan modelos ni se incluye Ollama en Docker Compose.
+
+La arquitectura está documentada en [`docs/llm-provider-architecture.md`](docs/llm-provider-architecture.md), [`docs/ollama-provider.md`](docs/ollama-provider.md) y [`docs/adr-multi-provider-llm.md`](docs/adr-multi-provider-llm.md).
+
+Las pruebas reales son opt-in y no forman parte de los checks normales:
+
+```bash
+npm run test:llm:lmstudio
+npm run test:llm:ollama
+```
+
+La arquitectura no fija `phi4-mini`: selecciona `LLM_PROVIDER=lmstudio` u
+`LLM_PROVIDER=ollama` y el modelo correspondiente mediante variables de entorno.
+El freeze v1 y sus límites están documentados en
+[`docs/ai-engine-v1-freeze.md`](docs/ai-engine-v1-freeze.md). El benchmark local
+de runtime de phi4-mini está resumido en
+[`docs/phi4-mini-runtime-benchmark-c3.md`](docs/phi4-mini-runtime-benchmark-c3.md).
+
+## Fase A: hardening y contrato v1
+
+El contrato para consumidores está documentado en [`docs/api-contract-v1.md`](docs/api-contract-v1.md).
+La línea base de seguridad está en [`docs/security-baseline.md`](docs/security-baseline.md) y la política de datos en [`docs/data-retention-and-privacy.md`](docs/data-retention-and-privacy.md).
+
+Fuera de desarrollo, el engine requiere `AI_ENGINE_API_KEY`; las claves se comparan de forma constant-time y no se usan directamente como identificadores de rate limit. El endpoint `/api/models/test` es interno, protegido y genera una llamada real al proveedor.
+
+Las migraciones son explícitas: ejecutar `npm run db:migrate` como paso aprobado antes de `npm run start`. El arranque de la aplicación no modifica automáticamente el esquema.

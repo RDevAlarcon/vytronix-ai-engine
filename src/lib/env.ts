@@ -3,13 +3,18 @@ import { z } from "zod";
 const envSchema = z.object({
   NODE_ENV: z.enum(["development", "test", "production"]).default("development"),
   DATABASE_URL: z.url(),
-  LLM_PROVIDER: z.enum(["lmstudio"]).default("lmstudio"),
-  LM_STUDIO_BASE_URL: z.url().default("http://127.0.0.1:1234"),
-  LM_STUDIO_MODEL: z.string().min(1).default("qwen2.5-7b-instruct"),
+  LLM_PROVIDER: z.enum(["lmstudio", "ollama"]).default("lmstudio"),
+  LM_STUDIO_BASE_URL: z.url().optional(),
+  LM_STUDIO_MODEL: z.string().min(1).optional(),
   LM_STUDIO_TEMPERATURE: z.coerce.number().min(0).max(2).default(0.2),
   LM_STUDIO_MAX_TOKENS: z.coerce.number().int().min(64).max(8192).default(1200),
+  OLLAMA_BASE_URL: z.url().optional(),
+  OLLAMA_MODEL: z.string().min(1).optional(),
+  OLLAMA_TEMPERATURE: z.coerce.number().min(0).max(2).default(0.2),
+  OLLAMA_MAX_TOKENS: z.coerce.number().int().min(64).max(8192).default(1200),
   LLM_REQUEST_TIMEOUT_MS: z.coerce.number().int().min(1000).max(120000).default(45000),
   API_KEY_REQUIRED: z.coerce.boolean().default(false),
+  AI_ENGINE_API_KEY: z.string().min(16).optional(),
   INTERNAL_API_KEY: z.string().min(16).optional(),
   RATE_LIMIT_ENABLED: z.coerce.boolean().default(true),
   RATE_LIMIT_WINDOW_MS: z.coerce.number().int().min(1000).max(600000).default(60000),
@@ -25,8 +30,46 @@ if (!parsed.success) {
   throw new Error(`Invalid environment configuration: ${issues}`);
 }
 
-if (parsed.data.API_KEY_REQUIRED && !parsed.data.INTERNAL_API_KEY) {
-  throw new Error("Invalid environment configuration: INTERNAL_API_KEY is required when API_KEY_REQUIRED=true");
+const configuredApiKey = parsed.data.AI_ENGINE_API_KEY ?? parsed.data.INTERNAL_API_KEY;
+const apiKeyRequired = parsed.data.NODE_ENV === "production" || parsed.data.API_KEY_REQUIRED;
+const isNextBuild = process.env.NEXT_PHASE === "phase-production-build";
+
+if (apiKeyRequired && !configuredApiKey && !isNextBuild) {
+  throw new Error("Invalid environment configuration: AI_ENGINE_API_KEY is required outside development");
 }
 
-export const env = parsed.data;
+const providerConfig = parsed.data.LLM_PROVIDER === "lmstudio"
+  ? {
+      baseUrl: parsed.data.LM_STUDIO_BASE_URL,
+      model: parsed.data.LM_STUDIO_MODEL,
+      temperature: parsed.data.LM_STUDIO_TEMPERATURE,
+      maxTokens: parsed.data.LM_STUDIO_MAX_TOKENS
+    }
+  : {
+      baseUrl: parsed.data.OLLAMA_BASE_URL,
+      model: parsed.data.OLLAMA_MODEL,
+      temperature: parsed.data.OLLAMA_TEMPERATURE,
+      maxTokens: parsed.data.OLLAMA_MAX_TOKENS
+    };
+
+if (!providerConfig.baseUrl || !providerConfig.model) {
+  throw new Error(`Invalid environment configuration: ${parsed.data.LLM_PROVIDER} provider requires base URL and model`);
+}
+
+export const env = {
+  ...parsed.data,
+  API_KEY_REQUIRED: apiKeyRequired,
+  AI_ENGINE_API_KEY: configuredApiKey,
+  LM_STUDIO: {
+    baseUrl: parsed.data.LM_STUDIO_BASE_URL ?? "http://127.0.0.1:1234",
+    model: parsed.data.LM_STUDIO_MODEL ?? "qwen2.5-7b-instruct",
+    temperature: parsed.data.LM_STUDIO_TEMPERATURE,
+    maxTokens: parsed.data.LM_STUDIO_MAX_TOKENS
+  },
+  OLLAMA: {
+    baseUrl: parsed.data.OLLAMA_BASE_URL ?? "http://127.0.0.1:11434",
+    model: parsed.data.OLLAMA_MODEL ?? "",
+    temperature: parsed.data.OLLAMA_TEMPERATURE,
+    maxTokens: parsed.data.OLLAMA_MAX_TOKENS
+  }
+};

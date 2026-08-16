@@ -2,12 +2,13 @@ import { NextRequest, NextResponse } from "next/server";
 import { z } from "zod";
 import { runAgent } from "@/ai/agents/agent.router";
 import { createAgentRun } from "@/db/repositories/agent-runs.repository";
-import { AppError, toErrorMessage } from "@/lib/errors";
+import { AppError, toErrorMessage, toPublicError } from "@/lib/errors";
 import { enforceApiGuard } from "@/lib/api-guard";
+import { assertRequestBodySize } from "@/lib/request-limits";
 
 export const runtime = "nodejs";
 
-const runSchema = z.object({
+export const runSchema = z.object({
   agent: z.enum(["lead", "landing", "proposal", "support"]),
   input: z.unknown(),
   mode: z.enum(["standard", "fast"]).default("standard")
@@ -19,6 +20,7 @@ export async function POST(request: NextRequest) {
   try {
     enforceApiGuard(request);
     const raw = (await request.json()) as unknown;
+    assertRequestBodySize(raw, request.headers.get("content-length"));
     payload = runSchema.parse(raw);
 
     const result = await runAgent(payload);
@@ -59,20 +61,6 @@ export async function POST(request: NextRequest) {
       // ignore persistence errors in failure path
     }
 
-    if (error instanceof AppError) {
-      return NextResponse.json(
-        {
-          success: false,
-          error: {
-            code: error.code,
-            message: error.message,
-            details: error.details
-          }
-        },
-        { status: error.status }
-      );
-    }
-
     if (error instanceof z.ZodError) {
       return NextResponse.json(
         {
@@ -87,15 +75,8 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    return NextResponse.json(
-      {
-        success: false,
-        error: {
-          code: "UNEXPECTED_ERROR",
-          message: toErrorMessage(error)
-        }
-      },
-      { status: 500 }
-    );
+    const publicError = toPublicError(error);
+    console.error(JSON.stringify({ event: "agent_run_failed", agent: fallbackAgent, code: publicError.code, timestamp: new Date().toISOString() }));
+    return NextResponse.json({ success: false, error: publicError }, { status: error instanceof AppError ? error.status : 500 });
   }
 }

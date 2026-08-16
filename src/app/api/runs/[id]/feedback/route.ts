@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { z } from "zod";
 import { updateAgentRunFeedback } from "@/db/repositories/agent-runs.repository";
-import { AppError, toErrorMessage } from "@/lib/errors";
+import { AppError, toPublicError } from "@/lib/errors";
 import { enforceApiGuard } from "@/lib/api-guard";
 
 export const runtime = "nodejs";
@@ -43,14 +43,7 @@ export async function POST(request: NextRequest, { params }: RouteProps) {
   } catch (error) {
     if (error instanceof AppError) {
       return NextResponse.json(
-        {
-          success: false,
-          error: {
-            code: error.code,
-            message: error.message,
-            details: error.details
-          }
-        },
+        { success: false, error: toPublicError(error) },
         { status: error.status }
       );
     }
@@ -69,15 +62,6 @@ export async function POST(request: NextRequest, { params }: RouteProps) {
       );
     }
 
-    return NextResponse.json(
-      {
-        success: false,
-        error: {
-          code: "UNEXPECTED_ERROR",
-          message: toErrorMessage(error)
-        }
-      },
-      { status: 500 }
-    );
+    return NextResponse.json({ success: false, error: toPublicError(error) }, { status: 500 });
   }
 }

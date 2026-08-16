@@ -22,3 +22,6 @@
 
 # drizzle artifacts
 /.drizzle
+
+# benchmark outputs
+/benchmarks/results

@@ -19,3 +19,15 @@ export const toErrorMessage = (error: unknown): string => {
 
   return "Unknown error";
 };
+
+export const toPublicError = (error: unknown): { code: string; message: string } => {
+  if (error instanceof AppError) {
+    return { code: error.code, message: error.message };
+  }
+
+  if (error instanceof Error) {
+    return { code: "UNEXPECTED_ERROR", message: "Unexpected error" };
+  }
+
+  return { code: "UNEXPECTED_ERROR", message: "Unexpected error" };
+};

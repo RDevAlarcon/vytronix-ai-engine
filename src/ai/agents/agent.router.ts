@@ -13,7 +13,7 @@ import type {
 import { classifyAgentScope } from "@/ai/agents/intent.classifier";
 import { llmService } from "@/ai/llm/llm.service";
 import { AppError } from "@/lib/errors";
-import { extractJsonObject, safeJsonParse } from "@/lib/json";
+import { executeStructuredOutput } from "@/ai/structured-output/structured-output";
 
 const runRequestSchema = z.object({
   agent: z.enum(["lead", "landing", "proposal", "support"]),
@@ -30,16 +30,6 @@ const agentRegistry = {
 
 export const getAgentDefinition = (name: AgentName) => agentRegistry[name];
 const FAST_ENABLED_AGENTS = new Set<AgentName>(["lead"]);
-
-const MAX_RETRIES = 1;
-const RETRYABLE_CODES = new Set(["LLM_INVALID_JSON", "LLM_JSON_NOT_FOUND", "AGENT_OUTPUT_INVALID"]);
-
-const shouldRetry = (error: unknown) => error instanceof AppError && RETRYABLE_CODES.has(error.code);
-
-const buildRetryInstruction = (outputSchemaShape: unknown) =>
-  `Your previous answer was invalid. Return ONLY valid JSON with this shape:
-${JSON.stringify(outputSchemaShape)}
-No markdown. No explanations.`;
 
 const resolveMaxTokens = (
   mode: AgentExecutionMode,
@@ -165,61 +155,24 @@ export const runAgent = async (request: AgentRunRequest): Promise<AgentRunResult
       : agentDefinition.buildMessages(parsedInput.data);
   const maxTokens = resolveMaxTokens(effectiveMode, agentDefinition.llmOptions);
   const temperature = resolveTemperature(effectiveMode, agentDefinition.llmOptions);
-  const maxRetries = effectiveMode === "fast" ? 1 : MAX_RETRIES;
-
-  let attempts = 0;
-  let lastError: unknown = null;
-
-  while (attempts <= maxRetries) {
-    attempts += 1;
-
-    try {
-      const retryInstruction =
-        attempts > 1
-          ? [
-              {
-                role: "user" as const,
-                content: buildRetryInstruction(z.toJSONSchema(agentDefinition.outputSchema))
-              }
-            ]
-          : [];
-
-      const llmResponse = await llmService.chat({
-        messages: [...baseMessages, ...retryInstruction],
-        temperature,
-        maxTokens
-      });
-
-      const jsonText = extractJsonObject(llmResponse.content);
-      const maybeOutput = safeJsonParse<unknown>(jsonText);
-      const parsedOutput = agentDefinition.outputSchema.safeParse(maybeOutput);
-
-      if (!parsedOutput.success) {
-        throw new AppError("LLM output does not match expected schema", {
-          code: "AGENT_OUTPUT_INVALID",
-          status: 502,
-          details: parsedOutput.error.flatten()
-        });
-      }
-
-      return {
+  const execution = await executeStructuredOutput({
+    baseMessages,
+    schema: agentDefinition.outputSchema,
+    schemaDescription: z.toJSONSchema(agentDefinition.outputSchema),
+    generate: (messages) => llmService.chat({ messages, temperature, maxTokens }),
+    captureRawOutput: process.env.BENCHMARK_CAPTURE_RAW_OUTPUT === "true"
+  });
+  return {
         agent: parsedRequest.agent,
         mode: effectiveMode,
-        parsedOutput: parsedOutput.data,
-        rawOutput: llmResponse.content,
-        model: llmResponse.model,
-        provider: llmResponse.provider,
-        usage: llmResponse.usage,
-        attemptCount: attempts,
+        parsedOutput: execution.parsedOutput,
+        rawOutput: execution.rawOutput,
+        model: execution.response.model,
+        provider: execution.response.provider,
+        usage: execution.response.usage,
+        attemptCount: execution.attemptCount,
+        repairAttempt: execution.repairAttempt,
+        diagnostics: execution.diagnostics,
         durationMs: Date.now() - startedAt
       };
-    } catch (error) {
-      lastError = error;
-      if (!shouldRetry(error) || attempts > maxRetries) {
-        throw error;
-      }
-    }
-  }
-
-  throw lastError;
 };

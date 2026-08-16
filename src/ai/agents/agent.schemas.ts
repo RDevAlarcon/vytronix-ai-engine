@@ -7,28 +7,30 @@ const scopeGuardSchema = {
 };
 
 export const leadInputSchema = z.object({
-  leadMessage: z.string().min(10),
-  companyContext: z.string().optional(),
-  knownServices: z.array(z.string().min(1)).default([])
+  leadMessage: z.string().min(10).max(4000),
+  companyContext: z.string().max(2000).optional(),
+  knownServices: z.array(z.string().min(1).max(200)).max(20).default([])
 });
+
+export const UNKNOWN_DETECTED_SERVICE = "unknown";
 
 export const leadOutputSchema = z.object({
   summary: z.string().min(1),
   detected_service: z.string().min(1),
   lead_temperature: z.enum(["cold", "warm", "hot"]),
-  missing_information: z.array(z.string()),
-  suggested_next_action: z.string().min(1),
-  reply_to_client: z.string().min(1),
+  missing_information: z.array(z.string().max(500)).max(20),
+  suggested_next_action: z.string().min(1).max(2000),
+  reply_to_client: z.string().min(1).max(4000),
   ...scopeGuardSchema
 });
 
 export const landingInputSchema = z.object({
-  projectName: z.string().min(2),
-  objective: z.string().min(10),
-  audience: z.string().min(5),
-  offer: z.string().min(3),
-  constraints: z.array(z.string()).default([]),
-  notes: z.string().optional()
+  projectName: z.string().min(2).max(300),
+  objective: z.string().min(10).max(4000),
+  audience: z.string().min(5).max(2000),
+  offer: z.string().min(3).max(2000),
+  constraints: z.array(z.string().max(500)).max(20).default([]),
+  notes: z.string().max(2000).optional()
 });
 
 export const landingOutputSchema = z.object({
@@ -36,37 +38,37 @@ export const landingOutputSchema = z.object({
   recommended_template: z.string().min(1),
   primary_cta: z.string().min(1),
   secondary_cta: z.string().min(1),
-  suggested_sections: z.array(z.string()).min(1),
-  missing_information: z.array(z.string()),
-  brief_markdown: z.string().min(1),
+  suggested_sections: z.array(z.string().max(200)).min(1).max(20),
+  missing_information: z.array(z.string().max(500)).max(20),
+  brief_markdown: z.string().min(1).max(12000),
   ...scopeGuardSchema
 });
 
 export const proposalInputSchema = z.object({
-  clientName: z.string().min(2),
-  businessGoal: z.string().min(10),
-  requestedServices: z.array(z.string()).min(1),
-  timeline: z.string().optional(),
-  budgetRange: z.string().optional(),
-  constraints: z.array(z.string()).default([])
+  clientName: z.string().min(2).max(300),
+  businessGoal: z.string().min(10).max(4000),
+  requestedServices: z.array(z.string().max(500)).min(1).max(20),
+  timeline: z.string().max(500).optional(),
+  budgetRange: z.string().max(500).optional(),
+  constraints: z.array(z.string().max(500)).max(20).default([])
 });
 
 export const proposalOutputSchema = z.object({
   proposal_title: z.string().min(1),
   executive_summary: z.string().min(1),
-  scope: z.array(z.string()).min(1),
-  deliverables: z.array(z.string()).min(1),
-  assumptions: z.array(z.string()),
-  next_steps: z.array(z.string()).min(1),
+  scope: z.array(z.string().max(500)).min(1).max(20),
+  deliverables: z.array(z.string().max(500)).min(1).max(20),
+  assumptions: z.array(z.string().max(500)).max(20),
+  next_steps: z.array(z.string().max(500)).min(1).max(20),
   ...scopeGuardSchema
 });
 
 export const supportInputSchema = z.object({
-  ticketMessage: z.string().min(10),
-  customerName: z.string().optional(),
-  accountType: z.string().optional(),
-  productArea: z.string().optional(),
-  knownContext: z.string().optional()
+  ticketMessage: z.string().min(10).max(4000),
+  customerName: z.string().max(300).optional(),
+  accountType: z.string().max(100).optional(),
+  productArea: z.string().max(300).optional(),
+  knownContext: z.string().max(2000).optional()
 });
 
 export const supportOutputSchema = z.object({

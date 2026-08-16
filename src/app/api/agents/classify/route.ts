@@ -2,7 +2,8 @@ import { NextRequest, NextResponse } from "next/server";
 import { z } from "zod";
 import { classifyAgentScope } from "@/ai/agents/intent.classifier";
 import { enforceApiGuard } from "@/lib/api-guard";
-import { AppError } from "@/lib/errors";
+import { AppError, toPublicError } from "@/lib/errors";
+import { assertRequestBodySize } from "@/lib/request-limits";
 
 export const runtime = "nodejs";
 
@@ -15,6 +16,7 @@ export async function POST(request: NextRequest) {
   try {
     enforceApiGuard(request);
     const raw = (await request.json()) as unknown;
+    assertRequestBodySize(raw, request.headers.get("content-length"));
     const payload = classifySchema.parse(raw);
     const result = classifyAgentScope(payload.agent, payload.input);
 
@@ -30,14 +32,7 @@ export async function POST(request: NextRequest) {
   } catch (error) {
     if (error instanceof AppError) {
       return NextResponse.json(
-        {
-          success: false,
-          error: {
-            code: error.code,
-            message: error.message,
-            details: error.details
-          }
-        },
+        { success: false, error: toPublicError(error) },
         { status: error.status }
       );
     }
@@ -56,15 +51,6 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    return NextResponse.json(
-      {
-        success: false,
-        error: {
-          code: "UNEXPECTED_ERROR",
-          message: error instanceof Error ? error.message : "Unexpected error"
-        }
-      },
-      { status: 500 }
-    );
+    return NextResponse.json({ success: false, error: toPublicError(error) }, { status: 500 });
   }
 }
