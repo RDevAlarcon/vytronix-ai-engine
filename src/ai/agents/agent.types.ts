@@ -1,6 +1,7 @@
 import { z } from "zod";
 import type { ChatMessage } from "@/ai/llm/llm.types";
 import type { StructuredOutputDiagnostic } from "@/ai/structured-output/structured-output";
+import type { RagContext } from "@/ai/rag/rag-context";
 
 export type AgentName = "lead" | "landing" | "proposal" | "support";
 export type AgentExecutionMode = "standard" | "fast";
@@ -22,6 +23,7 @@ export type AgentRunRequest = {
   agent: AgentName;
   input: unknown;
   mode?: AgentExecutionMode;
+  ragContext?: RagContext;
 };
 
 export type AgentRunResult<TOutput = unknown> = {

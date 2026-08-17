@@ -5,13 +5,15 @@ import { createAgentRun } from "@/db/repositories/agent-runs.repository";
 import { AppError, toErrorMessage, toPublicError } from "@/lib/errors";
 import { enforceApiGuard } from "@/lib/api-guard";
 import { assertRequestBodySize } from "@/lib/request-limits";
+import { ragContextSchema } from "@/ai/rag/rag-context";
 
 export const runtime = "nodejs";
 
 export const runSchema = z.object({
   agent: z.enum(["lead", "landing", "proposal", "support"]),
   input: z.unknown(),
-  mode: z.enum(["standard", "fast"]).default("standard")
+  mode: z.enum(["standard", "fast"]).default("standard"),
+  ragContext: ragContextSchema.optional()
 });
 
 export async function POST(request: NextRequest) {

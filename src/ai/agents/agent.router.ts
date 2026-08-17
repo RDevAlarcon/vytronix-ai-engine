@@ -14,11 +14,13 @@ import { classifyAgentScope } from "@/ai/agents/intent.classifier";
 import { llmService } from "@/ai/llm/llm.service";
 import { AppError } from "@/lib/errors";
 import { executeStructuredOutput } from "@/ai/structured-output/structured-output";
+import { buildRetrievedKnowledgeMessage, ragContextSchema } from "@/ai/rag/rag-context";
 
 const runRequestSchema = z.object({
   agent: z.enum(["lead", "landing", "proposal", "support"]),
   input: z.unknown(),
-  mode: z.enum(["standard", "fast"]).default("standard")
+  mode: z.enum(["standard", "fast"]).default("standard"),
+  ragContext: ragContextSchema.optional()
 });
 
 const agentRegistry = {
@@ -153,10 +155,11 @@ export const runAgent = async (request: AgentRunRequest): Promise<AgentRunResult
     effectiveMode === "fast" && agentDefinition.buildFastMessages
       ? agentDefinition.buildFastMessages(parsedInput.data)
       : agentDefinition.buildMessages(parsedInput.data);
+  const messagesWithKnowledge = [...baseMessages, ...buildRetrievedKnowledgeMessage(parsedRequest.ragContext)];
   const maxTokens = resolveMaxTokens(effectiveMode, agentDefinition.llmOptions);
   const temperature = resolveTemperature(effectiveMode, agentDefinition.llmOptions);
   const execution = await executeStructuredOutput({
-    baseMessages,
+    baseMessages: messagesWithKnowledge,
     schema: agentDefinition.outputSchema,
     schemaDescription: z.toJSONSchema(agentDefinition.outputSchema),
     generate: (messages) => llmService.chat({ messages, temperature, maxTokens }),

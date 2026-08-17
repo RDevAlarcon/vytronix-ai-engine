@@ -462,6 +462,14 @@ El freeze v1 y sus límites están documentados en
 de runtime de phi4-mini está resumido en
 [`docs/phi4-mini-runtime-benchmark-c3.md`](docs/phi4-mini-runtime-benchmark-c3.md).
 
+## RAG context v1.1
+
+El endpoint `/api/agents/run` acepta opcionalmente `ragContext` con contexto ya
+recuperado. El Engine no implementa retrieval, embeddings, vector DB ni
+Knowledge Base; VyAssistant conserva esas responsabilidades. El contrato y
+las reglas de seguridad están en [`docs/rag-context-contract-v1-1.md`](docs/rag-context-contract-v1-1.md)
+y [`docs/rag-security.md`](docs/rag-security.md).
+
 ## Fase A: hardening y contrato v1
 
 El contrato para consumidores está documentado en [`docs/api-contract-v1.md`](docs/api-contract-v1.md).
