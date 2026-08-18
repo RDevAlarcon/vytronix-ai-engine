@@ -1,5 +1,7 @@
 # vytronix-ai-engine
 
+La v1.2 añade structured tool calling opcional: el Engine decide y valida una solicitud, pero nunca ejecuta herramientas. Consulta [tool-calling-contract-v1-2.md](docs/tool-calling-contract-v1-2.md) y [tool-calling-security.md](docs/tool-calling-security.md).
+
 > Vytronix AI Engine v1 — frozen baseline. Current benchmark candidate: Ollama + `phi4-mini`. Provider and model remain configurable.
 
 Motor interno de agentes IA de Vytronix, separado del sitio principal (`vytronix.cl`), diseñado para correr local-first con LM Studio y preparado para despliegue futuro en Railway/Vercel.

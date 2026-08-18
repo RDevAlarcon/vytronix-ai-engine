@@ -58,7 +58,7 @@ export const createAgentRun = async (params: PersistParams): Promise<string> => 
     })
     .returning({ id: agentRuns.id });
 
-  if (params.result && run) {
+  if (params.result && run && params.result.parsedOutput && !params.result.orchestration) {
     await persistSpecializedRecord(run.id, params.agent, params.result.parsedOutput);
   }
 

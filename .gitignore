@@ -25,3 +25,7 @@
 
 # benchmark outputs
 /benchmarks/results
+
+# generated TypeScript/build artifacts
+*.tsbuildinfo
+/tmp

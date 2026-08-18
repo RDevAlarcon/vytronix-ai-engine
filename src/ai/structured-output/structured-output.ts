@@ -26,6 +26,12 @@ export type StructuredOutputDiagnostic = {
   extractedJsonLength?: number;
   jsonParseSuccess?: boolean;
   zodIssues?: StructuredOutputIssue[];
+  orchestrationType?: "RESPOND" | "CALL_TOOL" | "UNKNOWN";
+  toolName?: string;
+  argumentsPresent?: boolean;
+  toolResultPresent?: boolean;
+  toolResultStatus?: string;
+  expectedBehavior?: "RESPOND" | "CALL_TOOL";
   success: boolean;
 };
 
@@ -66,6 +72,7 @@ export const buildStructuredOutputRepairPrompt = (params: {
   previousOutput: string;
   issues: StructuredOutputIssue[];
   schema: unknown;
+  additionalInstructions?: string;
 }): string => {
   const previous = params.previousOutput.length > MAX_TEXT
     ? `${params.previousOutput.slice(0, MAX_TEXT - 3)}...`
@@ -76,7 +83,8 @@ export const buildStructuredOutputRepairPrompt = (params: {
     "Devuelve exclusivamente un objeto JSON válido, sin markdown ni explicaciones.",
     `Errores de validación: ${JSON.stringify(params.issues).slice(0, MAX_TEXT)}`,
     `Schema esperado: ${JSON.stringify(params.schema).slice(0, MAX_TEXT)}`,
-    `Respuesta anterior: ${previous}`
+    `Respuesta anterior: ${previous}`,
+    ...(params.additionalInstructions ? [params.additionalInstructions] : [])
   ].join("\n");
 };
 
@@ -94,6 +102,10 @@ export const executeStructuredOutput = async <T>(params: {
   schema: z.ZodType<T>;
   schemaDescription: unknown;
   generate: (messages: ChatMessage[]) => Promise<LlmChatResponse>;
+  validate?: (parsedOutput: T) => void;
+  inspectParsed?: (parsedOutput: unknown) => Partial<StructuredOutputDiagnostic>;
+  diagnosticContext?: Partial<StructuredOutputDiagnostic>;
+  repairInstructions?: string;
   captureRawOutput?: boolean;
   maxDiagnosticOutputLength?: number;
 }): Promise<StructuredOutputExecution<T>> => {
@@ -106,7 +118,7 @@ export const executeStructuredOutput = async <T>(params: {
       ? params.baseMessages
       : [...params.baseMessages, {
           role: "user" as const,
-          content: buildStructuredOutputRepairPrompt({ previousOutput, issues, schema: params.schemaDescription })
+          content: buildStructuredOutputRepairPrompt({ previousOutput, issues, schema: params.schemaDescription, additionalInstructions: params.repairInstructions })
         }];
     try {
       const response = await params.generate(messages);
@@ -119,7 +131,9 @@ export const executeStructuredOutput = async <T>(params: {
         rawContentExists: Boolean(response.content),
         rawOutput: params.captureRawOutput ? response.content.slice(0, limit) : undefined,
         rawOutputTruncated: params.captureRawOutput ? response.content.length > limit : undefined,
-        fencedJsonDetected: /```(?:json)?\s*[\s\S]*?```/i.test(response.content), success: false
+        fencedJsonDetected: /```(?:json)?\s*[\s\S]*?```/i.test(response.content),
+        ...params.diagnosticContext,
+        success: false
       };
       diagnostics.push(diagnostic);
       try {
@@ -128,12 +142,14 @@ export const executeStructuredOutput = async <T>(params: {
         diagnostic.extractedJsonLength = jsonText.length;
         const parsed = safeJsonParse<unknown>(jsonText);
         diagnostic.jsonParseSuccess = true;
+        Object.assign(diagnostic, params.inspectParsed?.(parsed));
         const validated = params.schema.safeParse(parsed);
         if (!validated.success) {
           diagnostic.stage = `${prefix}_SCHEMA`;
           diagnostic.zodIssues = summarizeZodIssues(validated.error);
           throw validationError(diagnostic.zodIssues);
         }
+        params.validate?.(validated.data);
         diagnostic.success = true;
         return { parsedOutput: validated.data, rawOutput: response.content, response, attemptCount: attempt, repairAttempt: attempt === 2, diagnostics };
       } catch (error) {
@@ -149,8 +165,10 @@ export const executeStructuredOutput = async <T>(params: {
         issues = details?.validationIssues ?? [];
       } else if (error instanceof AppError && (error.code === "LLM_INVALID_JSON" || error.code === "LLM_JSON_NOT_FOUND")) {
         issues = [{ path: "$", code: error.code, message: "El resultado no contiene JSON válido." }];
+      } else if (error instanceof AppError && ["TOOL_NOT_AVAILABLE", "TOOL_ARGUMENTS_INVALID", "TOOL_CALL_INVALID", "TOOL_SELECTION_INVALID"].includes(error.code)) {
+        issues = [{ path: "action", code: error.code, message: error.message }];
       }
-      if (attempt === 2 || !(error instanceof AppError) || !["LLM_INVALID_JSON", "LLM_JSON_NOT_FOUND", "AGENT_OUTPUT_INVALID"].includes(error.code)) {
+      if (attempt === 2 || !(error instanceof AppError) || !["LLM_INVALID_JSON", "LLM_JSON_NOT_FOUND", "AGENT_OUTPUT_INVALID", "TOOL_NOT_AVAILABLE", "TOOL_ARGUMENTS_INVALID", "TOOL_CALL_INVALID", "TOOL_SELECTION_INVALID"].includes(error.code)) {
         if (error instanceof AppError) throw new AppError(error.message, { code: error.code, status: error.status, details: { ...(error.details as object ?? {}), diagnostics } });
         throw error;
       }

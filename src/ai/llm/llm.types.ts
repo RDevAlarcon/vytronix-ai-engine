@@ -7,6 +7,9 @@ export type LlmMessage = {
   content: string;
 };
 
+export type LlmNativeTool = { name: string; description: string; parameters: unknown };
+export type LlmToolCall = { id?: string; name: string; arguments: Record<string, unknown> };
+
 export type ChatMessage = LlmMessage;
 
 export type LlmChatRequest = {
@@ -15,6 +18,8 @@ export type LlmChatRequest = {
   temperature?: number;
   maxTokens?: number;
   timeoutMs?: number;
+  responseSchema?: unknown;
+  nativeTools?: LlmNativeTool[];
 };
 
 export type LlmUsage = {
@@ -30,6 +35,7 @@ export type LlmChatResponse = {
   usage?: LlmUsage;
   raw: unknown;
   finishReason?: string | null;
+  toolCalls?: LlmToolCall[];
 };
 
 export type LlmProviderHealth = {
@@ -41,4 +47,6 @@ export interface LlmProvider {
   readonly name: LlmProviderName;
   chat(request: LlmChatRequest): Promise<LlmChatResponse>;
   health(): LlmProviderHealth;
+  readonly supportsStructuredOutput: boolean;
+  readonly supportsNativeToolCalling: boolean;
 }

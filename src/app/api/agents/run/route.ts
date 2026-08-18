@@ -6,6 +6,7 @@ import { AppError, toErrorMessage, toPublicError } from "@/lib/errors";
 import { enforceApiGuard } from "@/lib/api-guard";
 import { assertRequestBodySize } from "@/lib/request-limits";
 import { ragContextSchema } from "@/ai/rag/rag-context";
+import { toolResultSchema, toolsSchema } from "@/ai/tools/tool-contract";
 
 export const runtime = "nodejs";
 
@@ -13,7 +14,9 @@ export const runSchema = z.object({
   agent: z.enum(["lead", "landing", "proposal", "support"]),
   input: z.unknown(),
   mode: z.enum(["standard", "fast"]).default("standard"),
-  ragContext: ragContextSchema.optional()
+  ragContext: ragContextSchema.optional(),
+  tools: toolsSchema.optional(),
+  toolResult: toolResultSchema.optional()
 });
 
 export async function POST(request: NextRequest) {
@@ -39,15 +42,16 @@ export async function POST(request: NextRequest) {
         agent: result.agent,
         parsedOutput: result.parsedOutput,
         rawOutput: result.rawOutput,
-        metadata: {
+          metadata: {
           mode: result.mode,
           model: result.model,
           provider: result.provider,
           attemptCount: result.attemptCount,
           durationMs: result.durationMs,
           usage: result.usage
+          },
+          ...(result.orchestration ? { orchestration: result.orchestration } : {})
         }
-      }
     });
   } catch (error) {
     const fallbackAgent = payload?.agent ?? "unknown";

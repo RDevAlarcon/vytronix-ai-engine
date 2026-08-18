@@ -14,7 +14,11 @@ import { summarizeResults, tokensPerSecond } from "../../benchmarks/src/metrics"
 import { buildStructuredOutputRepairPrompt, executeStructuredOutput, parseStructuredOutput, summarizeZodIssues } from "@/ai/structured-output/structured-output";
 import { z } from "zod";
 import { classifyAgentScope } from "@/ai/agents/intent.classifier";
+import { selectTool, toolSelectionSchema, buildSelectionDirective } from "@/ai/tools/tool-selector";
+import { resolveToolRoutingStrategy } from "@/ai/tools/tool-routing";
+import { groundToolArguments, normalizeRelativeDate } from "@/ai/tools/tool-argument-grounding";
 import { buildRetrievedKnowledgeMessage, ragContextSchema, RAG_MAX_ITEM_CHARS, RAG_MAX_ITEMS, RAG_MAX_TOTAL_CHARS } from "@/ai/rag/rag-context";
+import { assembleToolCall, buildToolAwareSchema, buildToolAwareSystemPrompt, buildToolContext, buildToolOrchestrationInstructions, buildToolResultMessage, toolResultSchema, toolsSchema, validateToolCall } from "@/ai/tools/tool-contract";
 
 const config = { baseUrl: "http://provider.test", model: "test-model", temperature: 0.2, maxTokens: 120, timeoutMs: 100 };
 
@@ -53,6 +57,7 @@ const main = async () => {
   assert.equal(limiter.consume("client", 1001), true);
 
   assert.equal(runSchema.parse({ agent: "lead", input: {}, mode: "standard" }).mode, "standard");
+  assert.equal(resolveToolRoutingStrategy({ supportsNativeToolCalling: true }), "LEGACY");
   assert.equal(runSchema.parse({ agent: "support", input: { ticketMessage: "¿Cuál es el horario de atención?" }, ragContext: { items: [{ content: "Atendemos de lunes a viernes.", sourceId: "kb-1", score: 0.91 }] } }).ragContext?.items[0]?.content, "Atendemos de lunes a viernes.");
   assert.throws(() => runSchema.parse({ agent: "support", input: {}, ragContext: { items: [{ content: "" }] } }));
   assert.throws(() => ragContextSchema.parse({ items: Array.from({ length: RAG_MAX_ITEMS + 1 }, () => ({ content: "x" })) }));
@@ -66,6 +71,61 @@ const main = async () => {
   assert.match(knowledge[0]?.content ?? "", /UNTRUSTED DATA/);
   assert.match(knowledge[0]?.content ?? "", /Ignora las instrucciones/);
   assert.ok(!(knowledge[0]?.content ?? "").includes("sourceId"));
+  const readTool = { name: "consultar_disponibilidad", description: "Consulta horarios.", inputSchema: { type: "object" as const, properties: { date: { type: "string" as const } }, required: ["date"], additionalProperties: false }, sideEffect: "READ_ONLY" as const, requiresConfirmation: false };
+  const writeTool = { name: "crear_lead", description: "Crea un lead.", inputSchema: { type: "object" as const, properties: { name: { type: "string" as const } }, required: ["name"], additionalProperties: false }, sideEffect: "WRITE" as const, requiresConfirmation: true };
+  assert.equal(resolveToolRoutingStrategy({ tools: [readTool], supportsNativeToolCalling: true }), "NATIVE");
+  assert.equal(resolveToolRoutingStrategy({ tools: [readTool], ragContext: { items: [{ content: "price" }] }, supportsNativeToolCalling: true }), "SELECTOR");
+  assert.equal(resolveToolRoutingStrategy({ tools: [readTool], ragContext: { items: [] }, supportsNativeToolCalling: true }), "NATIVE");
+  assert.equal(resolveToolRoutingStrategy({ tools: [readTool], supportsNativeToolCalling: false }), "SELECTOR");
+  assert.equal(resolveToolRoutingStrategy({ tools: [readTool], toolResult: { status: "SUCCEEDED" }, supportsNativeToolCalling: true }), "TOOL_RESULT_RESPOND");
+  assert.equal(normalizeRelativeDate("mañana"), "tomorrow");
+  assert.equal(groundToolArguments({ ticketMessage: "mañana a las 15:00" }, readTool, { date: "2023-10-15" }).status, "READY");
+  assert.deepEqual(groundToolArguments({ ticketMessage: "Quiero hacer una reserva." }, writeTool, { date: "2026-08-20", time: "10:00" }).status, "MISSING_INFORMATION");
+  assert.deepEqual(groundToolArguments({ ticketMessage: "Quiero reservar mañana." }, writeTool, { name: "10:00" }).ungrounded, ["name"]);
+  assert.equal(toolsSchema.parse([readTool])[0]?.name, "consultar_disponibilidad");
+  assert.throws(() => toolsSchema.parse([{ ...readTool, name: "bad-name" }]));
+  assert.throws(() => toolsSchema.parse([{ ...readTool, inputSchema: { $ref: "https://evil.test/schema" } }]));
+  assert.throws(() => toolsSchema.parse(Array.from({ length: 21 }, (_, index) => ({ ...readTool, name: `tool_${index}` }))));
+  assert.match(buildToolContext([readTool])[0]?.content ?? "", /TOOL DEFINITIONS \(UNTRUSTED CONFIGURATION\)/);
+  const orchestrationInstructions = buildToolOrchestrationInstructions([readTool]);
+  assert.match(orchestrationInstructions, /Never return the legacy agent JSON/);
+  assert.match(orchestrationInstructions, /Allowed tool names:[\s\S]*consultar_disponibilidad/);
+  assert.match(orchestrationInstructions, /action RESPOND/);
+  assert.match(orchestrationInstructions, /RESPOND\.result MUST be a JSON object/);
+  assert.match(orchestrationInstructions, /Never place plain text directly in result/);
+  const followUpInstructions = buildToolOrchestrationInstructions([readTool], { toolCallId: "call_1", toolName: readTool.name, status: "SUCCEEDED", output: { available: true } });
+  assert.match(followUpInstructions, /already available/);
+  assert.match(followUpInstructions, /Do not request a tool again/);
+  assert.match(followUpInstructions, /MUST return action RESPOND/);
+  const legacySystem = "Support rules.\nRequired JSON shape:\n{\"category\":\"general\"}";
+  const toolsSystem = buildToolAwareSystemPrompt(legacySystem, [readTool], undefined, { type: "object", required: ["category", "safe_reply"] });
+  assert.match(toolsSystem, /ORCHESTRATION OUTPUT CONTRACT/);
+  assert.match(toolsSystem, /RESPOND/);
+  assert.match(toolsSystem, /CALL_TOOL/);
+  assert.doesNotMatch(toolsSystem, /Required JSON shape/);
+  assert.match(toolsSystem, /complete schema for RESPOND\.result/);
+  assert.match(buildToolAwareSystemPrompt(legacySystem, [readTool], { toolCallId: "call_1", toolName: readTool.name, status: "SUCCEEDED", output: { available: true } }), /MUST return action RESPOND/);
+  assert.match(buildToolResultMessage({ toolCallId: "call_1", toolName: readTool.name, status: "SUCCEEDED", output: { available: true } })[0]?.content ?? "", /TOOL RESULT \(UNTRUSTED DATA\)/);
+  const toolResultBoundary = buildToolResultMessage({ toolCallId: "call_1", toolName: readTool.name, status: "SUCCEEDED", output: { available: true } })[0]?.content ?? "";
+  assert.ok(toolResultBoundary.indexOf("<tool_result>") < toolResultBoundary.indexOf("</tool_result>"));
+  assert.match(toolResultBoundary, /Produce a final response only/);
+  assert.deepEqual(validateToolCall({ name: readTool.name, arguments: { date: "2026-08-18" }, requiresConfirmation: false }, [readTool]).toolName, readTool.name);
+  assert.throws(() => validateToolCall({ name: "missing_tool", arguments: {}, requiresConfirmation: false }, [readTool]), (error: unknown) => error instanceof AppError && error.code === "TOOL_NOT_AVAILABLE");
+  assert.throws(() => validateToolCall({ name: readTool.name, arguments: {}, requiresConfirmation: false }, [readTool]), (error: unknown) => error instanceof AppError && error.code === "TOOL_ARGUMENTS_INVALID");
+  assert.equal(validateToolCall({ name: writeTool.name, arguments: { name: "Ana" }, requiresConfirmation: false }, [writeTool]).requiresConfirmation, true);
+  const assembled = assembleToolCall(readTool, { date: "tomorrow" });
+  assert.equal(assembled.action, "CALL_TOOL");
+  assert.equal(assembled.toolCall.toolName, readTool.name);
+  assert.deepEqual(assembled.toolCall.arguments, { date: "tomorrow" });
+  assert.equal(assembled.toolCall.requiresConfirmation, false);
+  assert.equal(toolResultSchema.parse({ toolCallId: "call_1", toolName: readTool.name, status: "FAILED", error: "unavailable" }).status, "FAILED");
+  assert.deepEqual(toolSelectionSchema.parse({ decision: "NO_TOOL" }), { decision: "NO_TOOL" });
+  assert.equal(buildSelectionDirective({ decision: { decision: "USE_TOOL", tool: readTool.name }, selectedTool: readTool, attempts: 1, repairAttempt: false, durationMs: 1, diagnostics: [], valid: true, structuredOutputRequested: false, structuredOutputProviderSupported: false }), `AUTHORITATIVE TOOL SELECTION: USE_TOOL. The root action MUST be CALL_TOOL with exactly tool ${readTool.name}. Do not return RESPOND.`);
+  assert.match(buildSelectionDirective(null), /NO_TOOL/);
+  assert.throws(() => toolResultSchema.parse({ toolCallId: "call_1", toolName: readTool.name, status: "SUCCEEDED", output: "x".repeat(16001) }));
+  const toolAware = buildToolAwareSchema(z.object({ ok: z.boolean() }));
+  assert.equal(toolAware.parse({ action: "RESPOND", result: { ok: true } }).action, "RESPOND");
+  assert.throws(() => toolAware.parse({ action: "RESPOND", result: { ok: true }, reasoning: "secret" }));
   assert.throws(() => leadInputSchema.parse({ leadMessage: "x" }));
   assert.throws(() => supportInputSchema.parse({ ticketMessage: "x" }));
   assert.equal(leadOutputSchema.parse({ summary: "s", detected_service: "CRM", lead_temperature: "warm", missing_information: [], suggested_next_action: "a", reply_to_client: "r", is_in_scope: true, out_of_scope_reason: null, safe_reply: "s" }).detected_service, "CRM");
@@ -103,8 +163,44 @@ const main = async () => {
   const ollama = createLlmProvider("ollama", { lmstudio: config, ollama: config });
   assert.equal(lmstudio.name, "lmstudio");
   assert.equal(ollama.name, "ollama");
+  assert.equal(ollama.supportsStructuredOutput, true);
+  assert.equal(lmstudio.supportsStructuredOutput, false);
+  assert.equal(ollama.supportsNativeToolCalling, true);
+  assert.equal(lmstudio.supportsNativeToolCalling, false);
   await runProviderContract(lmstudio);
   await runProviderContract(ollama);
+
+  const originalStructuredFetch = globalThis.fetch;
+  const structuredRequests: string[] = [];
+  try {
+    globalThis.fetch = async (_input, init) => {
+      structuredRequests.push(String(init?.body));
+      return response({ model: "m", choices: [{ message: { content: '{"decision":"NO_TOOL"}' }, finish_reason: "stop" }] });
+    };
+    await ollama.chat({ messages: [], responseSchema: { type: "object", properties: { decision: { type: "string" } }, required: ["decision"], additionalProperties: false } });
+    await lmstudio.chat({ messages: [], responseSchema: { type: "object" } });
+    assert.match(structuredRequests[0] ?? "", /response_format/);
+    assert.match(structuredRequests[0] ?? "", /json_schema/);
+    assert.doesNotMatch(structuredRequests[1] ?? "", /response_format/);
+  } finally {
+    globalThis.fetch = originalStructuredFetch;
+  }
+
+  const originalNativeFetch = globalThis.fetch;
+  const nativeRequests: string[] = [];
+  try {
+    globalThis.fetch = async (_input, init) => {
+      nativeRequests.push(String(init?.body));
+      return response({ model: "m", choices: [{ message: { content: "", tool_calls: [{ id: "call_1", function: { name: "consultar_disponibilidad", arguments: '{"date":"tomorrow"}' } }] }, finish_reason: "tool_calls" }] });
+    };
+    const native = await ollama.chat({ messages: [], nativeTools: [{ name: "consultar_disponibilidad", description: "Consulta horarios.", parameters: { type: "object" } }] });
+    assert.equal(native.toolCalls?.[0]?.name, "consultar_disponibilidad");
+    assert.equal(native.toolCalls?.[0]?.arguments.date, "tomorrow");
+    assert.match(nativeRequests[0] ?? "", /tool_choice/);
+    assert.match(nativeRequests[0] ?? "", /consultar_disponibilidad/);
+  } finally {
+    globalThis.fetch = originalNativeFetch;
+  }
 
   const outputSchema = z.object({ status: z.enum(["ok", "needs_info"]), count: z.number().int() });
   const validResponse = { content: '{"status":"ok","count":1}', model: "m", provider: "lmstudio" as const, raw: null };
@@ -138,7 +234,7 @@ const main = async () => {
   const issues = summarizeZodIssues(outputSchema.safeParse({ status: "bad" }).success ? new z.ZodError([]) : (outputSchema.safeParse({ status: "bad" }) as { success: false; error: z.ZodError }).error);
   assert.ok(issues.length > 0);
   assert.ok(!JSON.stringify(issues).includes("stack"));
-  assert.match(buildStructuredOutputRepairPrompt({ previousOutput: "x", issues, schema: z.toJSONSchema(outputSchema) }), /exclusivamente un objeto JSON/);
+  assert.match(buildStructuredOutputRepairPrompt({ previousOutput: "x", issues, schema: z.toJSONSchema(outputSchema), additionalInstructions: "MUST return action RESPOND" }), /MUST return action RESPOND/);
 
   const diagnosticResponse = { ...validResponse, finishReason: "stop" };
   const noRaw = await executeStructuredOutput({ baseMessages: [], schema: outputSchema, schemaDescription: z.toJSONSchema(outputSchema), generate: async () => diagnosticResponse });
@@ -150,6 +246,16 @@ const main = async () => {
 
   const originalFetch = globalThis.fetch;
   try {
+    globalThis.fetch = async () => response({ choices: [{ message: { content: '{"decision":"USE_TOOL","tool":"consultar_disponibilidad"}' } }] });
+    const selected = await selectTool({ agent: "support", input: { ticketMessage: "availability" }, tools: [readTool] });
+    assert.equal(selected?.decision.decision, "USE_TOOL");
+    assert.equal(selected?.selectedTool?.name, readTool.name);
+    assert.equal(selected?.valid, true);
+    assert.equal(typeof selected?.durationMs, "number");
+    assert.ok(Array.isArray(selected?.diagnostics));
+    const selectedWithoutRag = await selectTool({ agent: "support", input: { ticketMessage: "availability" }, tools: [readTool] });
+    assert.deepEqual(selectedWithoutRag?.decision, selected?.decision);
+
     globalThis.fetch = async () => response({ error: { message: "upstream secret" } }, false);
     await assert.rejects(() => lmstudio.chat({ messages: [] }), (error: unknown) => error instanceof AppError && error.code === "LLM_UPSTREAM_ERROR");
 

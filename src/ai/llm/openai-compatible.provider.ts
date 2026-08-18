@@ -3,7 +3,7 @@ import type { LlmChatRequest, LlmChatResponse, LlmProvider, LlmProviderHealth, L
 
 type OpenAiCompatiblePayload = {
   model?: string;
-  choices?: Array<{ message?: { content?: string | null }; finish_reason?: string | null }>;
+  choices?: Array<{ message?: { content?: string | null; tool_calls?: Array<{ id?: string; function?: { name?: string; arguments?: string } }> }; finish_reason?: string | null }>;
   usage?: { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number };
   error?: { message?: string };
 };
@@ -15,13 +15,19 @@ export type OpenAiCompatibleProviderConfig = {
   defaultTemperature: number;
   defaultMaxTokens: number;
   timeoutMs: number;
+  supportsStructuredOutput?: boolean;
+  supportsNativeToolCalling?: boolean;
 };
 
 export class OpenAiCompatibleProvider implements LlmProvider {
   readonly name: LlmProviderName;
+  readonly supportsStructuredOutput: boolean;
+  readonly supportsNativeToolCalling: boolean;
 
   constructor(private readonly config: OpenAiCompatibleProviderConfig) {
     this.name = config.name;
+    this.supportsStructuredOutput = config.supportsStructuredOutput ?? false;
+    this.supportsNativeToolCalling = config.supportsNativeToolCalling ?? false;
   }
 
   health(): LlmProviderHealth {
@@ -41,7 +47,14 @@ export class OpenAiCompatibleProvider implements LlmProvider {
           model: request.model ?? this.config.defaultModel,
           temperature: request.temperature ?? this.config.defaultTemperature,
           max_tokens: request.maxTokens ?? this.config.defaultMaxTokens,
-          messages: request.messages
+          messages: request.messages,
+          ...(request.nativeTools && this.supportsNativeToolCalling ? { tools: request.nativeTools.map((tool) => ({ type: "function", function: tool })) , tool_choice: "auto" } : {}),
+          ...(request.responseSchema && this.supportsStructuredOutput ? {
+            response_format: {
+              type: "json_schema",
+              json_schema: { name: "vytronix_output", strict: true, schema: request.responseSchema }
+            }
+          } : {})
         })
       });
       const payload = (await response.json()) as OpenAiCompatiblePayload;
@@ -54,8 +67,15 @@ export class OpenAiCompatibleProvider implements LlmProvider {
         });
       }
 
-      const content = payload.choices?.[0]?.message?.content?.trim();
-      if (!content) {
+      const content = payload.choices?.[0]?.message?.content?.trim() ?? "";
+      const nativeToolCalls = payload.choices?.[0]?.message?.tool_calls?.map((call) => ({
+        id: call.id,
+        name: call.function?.name ?? "",
+        arguments: JSON.parse(call.function?.arguments ?? "{}") as Record<string, unknown>
+      }));
+      // An empty native-tools response is a valid "no tool selected" signal.
+      // Keep empty-content strict for all ordinary/domain-only requests.
+      if (!content && !nativeToolCalls?.length && !request.nativeTools) {
         throw new AppError("LLM returned empty content", {
           code: "LLM_EMPTY_CONTENT",
           status: 502,
@@ -73,7 +93,8 @@ export class OpenAiCompatibleProvider implements LlmProvider {
           totalTokens: payload.usage?.total_tokens
         },
         raw: payload,
-        finishReason: payload.choices?.[0]?.finish_reason ?? null
+        finishReason: payload.choices?.[0]?.finish_reason ?? null,
+        toolCalls: nativeToolCalls
       };
     } catch (error) {
       if (error instanceof AppError) throw error;

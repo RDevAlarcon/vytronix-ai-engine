@@ -11,6 +11,14 @@ export class LlmService {
   health() {
     return this.provider.health();
   }
+
+  get supportsStructuredOutput() {
+    return this.provider.supportsStructuredOutput;
+  }
+
+  get supportsNativeToolCalling() {
+    return this.provider.supportsNativeToolCalling;
+  }
 }
 
 export const llmService = new LlmService();
