@@ -12,6 +12,8 @@ const envSchema = z.object({
   OLLAMA_MODEL: z.string().min(1).optional(),
   OLLAMA_TEMPERATURE: z.coerce.number().min(0).max(2).default(0.2),
   OLLAMA_MAX_TOKENS: z.coerce.number().int().min(64).max(8192).default(1200),
+  LLAMACPP_BASE_URL: z.url().default("http://127.0.0.1:8081"),
+  LLAMACPP_MODEL: z.string().min(1).default("granite4:3b"),
   LLM_REQUEST_TIMEOUT_MS: z.coerce.number().int().min(1000).max(120000).default(45000),
   API_KEY_REQUIRED: z.coerce.boolean().default(false),
   AI_ENGINE_API_KEY: z.string().min(16).optional(),
