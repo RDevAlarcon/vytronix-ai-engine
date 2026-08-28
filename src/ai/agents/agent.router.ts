@@ -183,8 +183,9 @@ export const runAgent = async (request: AgentRunRequest): Promise<AgentRunResult
     throw new AppError("Tool result does not match an available tool", { code: "TOOL_RESULT_INVALID", status: 400 });
   }
   const routingStrategy = resolveToolRoutingStrategy({ tools: availableTools, ragContext: parsedRequest.ragContext, toolResult: parsedRequest.toolResult, supportsNativeToolCalling: llmService.supportsNativeToolCalling });
-  const nativeToolCalling = routingStrategy === "NATIVE";
-  const toolSelection = routingStrategy === "SELECTOR" ? await selectTool({ agent: parsedRequest.agent, input: parsedInput.data, tools: availableTools, toolResult: parsedRequest.toolResult }) : null;
+  const separatedToolDecision = availableTools.length > 0 && !parsedRequest.toolResult;
+  const nativeToolCalling = routingStrategy === "NATIVE" && !separatedToolDecision;
+  const toolSelection = (routingStrategy === "SELECTOR" || separatedToolDecision) ? await selectTool({ agent: parsedRequest.agent, input: parsedInput.data, tools: availableTools, toolResult: parsedRequest.toolResult }) : null;
   const argumentExtraction = toolSelection?.decision.decision === "USE_TOOL" && toolSelection.selectedTool
     ? await extractToolArguments({ input: parsedInput.data, tool: toolSelection.selectedTool })
     : undefined;
@@ -392,7 +393,7 @@ export const runAgent = async (request: AgentRunRequest): Promise<AgentRunResult
         structuredOutputMode: llmService.supportsStructuredOutput ? "NATIVE_SCHEMA" : "TEXT_FALLBACK",
         toolRoutingStrategy: routingStrategy,
         nativePathUsed: routingStrategy === "NATIVE",
-        selectorPathUsed: routingStrategy === "SELECTOR",
+        selectorPathUsed: Boolean(toolSelection),
         structuredOutputUsed: llmService.supportsStructuredOutput,
         ...(orchestration ? { orchestration } : {})
       };
