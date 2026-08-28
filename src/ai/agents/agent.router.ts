@@ -56,6 +56,12 @@ const agentRegistry = {
 export const getAgentDefinition = (name: AgentName) => agentRegistry[name];
 const FAST_ENABLED_AGENTS = new Set<AgentName>(["lead"]);
 
+const isPureGreeting = (value: unknown): boolean => {
+  if (typeof value !== "string") return false;
+  const normalized = value.trim().toLocaleLowerCase().replace(/[!?.,;:]+$/g, "").replace(/\s+/g, " ");
+  return ["hola", "holi", "buenas", "buenos días", "buenas tardes", "buenas noches", "hey", "hello", "hi"].includes(normalized);
+};
+
 const resolveMaxTokens = (
   mode: AgentExecutionMode,
   options: AgentDefinition<unknown, unknown>["llmOptions"]
@@ -146,6 +152,13 @@ export const runAgent = async (request: AgentRunRequest): Promise<AgentRunResult
   const agentDefinition = getAgentDefinition(parsedRequest.agent) as AgentDefinition<unknown, unknown>;
   const effectiveMode: AgentExecutionMode =
     parsedRequest.mode === "fast" && FAST_ENABLED_AGENTS.has(parsedRequest.agent) ? "fast" : "standard";
+
+  const rawInput = parsedRequest.input as Record<string, unknown>;
+  const greeting = parsedRequest.agent === "support" && !parsedRequest.ragContext && !parsedRequest.toolResult && isPureGreeting(rawInput?.ticketMessage);
+  if (greeting) {
+    const output = agentDefinition.outputSchema.parse({ category: "general", priority: "low", summary: "Saludo inicial.", suggested_reply: "Hola, ¿en qué puedo ayudarte?", escalate_to_human: false, is_in_scope: true, out_of_scope_reason: null, safe_reply: "Hola, ¿en qué puedo ayudarte?" });
+    return { agent: parsedRequest.agent, mode: effectiveMode, parsedOutput: output, rawOutput: JSON.stringify(output), model: "deterministic-greeting", provider: "internal", attemptCount: 0, durationMs: 0 };
+  }
 
   const parsedInput = agentDefinition.inputSchema.safeParse(parsedRequest.input);
   if (!parsedInput.success) {

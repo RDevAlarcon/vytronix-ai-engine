@@ -20,9 +20,10 @@ import { selectTool, toolSelectionSchema, buildSelectionDirective } from "@/ai/t
 import { resolveToolRoutingStrategy } from "@/ai/tools/tool-routing";
 import { groundToolArguments, normalizeRelativeDate } from "@/ai/tools/tool-argument-grounding";
 import { buildRetrievedKnowledgeMessage, ragContextSchema, RAG_MAX_ITEM_CHARS, RAG_MAX_ITEMS, RAG_MAX_TOTAL_CHARS } from "@/ai/rag/rag-context";
+import { runAgent } from "@/ai/agents/agent.router";
 import { assembleToolCall, buildToolAwareSchema, buildToolAwareSystemPrompt, buildToolContext, buildToolOrchestrationInstructions, buildToolResultMessage, toolResultSchema, toolsSchema, validateToolCall } from "@/ai/tools/tool-contract";
 
-const config = { baseUrl: "http://provider.test", model: "test-model", temperature: 0.2, maxTokens: 120, timeoutMs: 100 };
+const config = { baseUrl: "http://provider.test", model: "test-model", temperature: 0.2, maxTokens: 120, timeoutMs: 100, keepAlive: "10m" };
 
 const response = (payload: unknown, ok = true) => ({ ok, json: async () => payload }) as Response;
 
@@ -57,6 +58,35 @@ const main = async () => {
   assert.equal(limiter.consume("client", 1), true);
   assert.equal(limiter.consume("client", 2), false);
   assert.equal(limiter.consume("client", 1001), true);
+
+  const greeting = await runAgent({ agent: "support", input: { ticketMessage: "Hola" } });
+  const greetingOutput = greeting.parsedOutput as Record<string, unknown>;
+  assert.equal(greeting.provider, "internal");
+  assert.equal(greeting.model, "deterministic-greeting");
+  assert.equal(greetingOutput.category, "general");
+  assert.equal(greetingOutput.priority, "low");
+  assert.equal(greetingOutput.is_in_scope, true);
+  assert.equal(greetingOutput.out_of_scope_reason, null);
+  assert.equal(typeof greetingOutput.summary, "string");
+  assert.equal(typeof greetingOutput.suggested_reply, "string");
+  assert.equal(typeof greetingOutput.escalate_to_human, "boolean");
+  assert.equal(typeof greetingOutput.safe_reply, "string");
+
+  const originalAgentFetch = globalThis.fetch;
+  try {
+    globalThis.fetch = async () => response({ choices: [{ message: { content: JSON.stringify({ category: "general", priority: "low", summary: "Solicitud recibida.", suggested_reply: "Indica qué necesitas.", escalate_to_human: false, is_in_scope: true, out_of_scope_reason: null, safe_reply: "Indica qué necesitas." }) } }] });
+    const nonGreeting = await runAgent({ agent: "support", input: { ticketMessage: "Necesito orientación general sobre cómo solicitar ayuda." } });
+    assert.notEqual(nonGreeting.model, "deterministic-greeting");
+    assert.notEqual(nonGreeting.provider, "internal");
+
+    const withRag = await runAgent({ agent: "support", input: { ticketMessage: "Hola, necesito información adicional." }, ragContext: { items: [{ content: "Referencia sintética.", sourceId: "fixture", score: 1 }] } });
+    assert.notEqual(withRag.model, "deterministic-greeting");
+
+    const withToolResult = await runAgent({ agent: "support", input: { ticketMessage: "Hola, necesito información adicional." }, toolResult: { toolCallId: "call_1", toolName: "consultar_disponibilidad", status: "SUCCEEDED", output: {} } });
+    assert.notEqual(withToolResult.model, "deterministic-greeting");
+  } finally {
+    globalThis.fetch = originalAgentFetch;
+  }
 
   assert.equal(runSchema.parse({ agent: "lead", input: {}, mode: "standard" }).mode, "standard");
   assert.equal(resolveToolRoutingStrategy({ supportsNativeToolCalling: true }), "LEGACY");
@@ -179,6 +209,22 @@ const main = async () => {
   assert.equal(llamacpp.supportsNativeToolCalling, false);
   assert.equal(env.LLAMACPP.baseUrl, "http://127.0.0.1:8081");
   assert.equal(env.LLAMACPP.model, "granite4:3b");
+  const keepAliveRequests: RequestInit[] = [];
+  const originalKeepAliveFetch = globalThis.fetch;
+  try {
+    globalThis.fetch = async (_input, init) => {
+      keepAliveRequests.push(init ?? {});
+      return response({ model: "m", choices: [{ message: { content: "{\"ok\":true}" } }] });
+    };
+    await ollama.chat({ messages: [{ role: "user", content: "hello" }] });
+    await llamacpp.chat({ messages: [{ role: "user", content: "hello" }] });
+    const ollamaPayload = JSON.parse(String(keepAliveRequests[0]?.body)) as Record<string, unknown>;
+    const llamaCppPayload = JSON.parse(String(keepAliveRequests[1]?.body)) as Record<string, unknown>;
+    assert.equal(ollamaPayload.keep_alive, "10m");
+    assert.equal("keep_alive" in llamaCppPayload, false);
+  } finally {
+    globalThis.fetch = originalKeepAliveFetch;
+  }
   await runProviderContract(lmstudio);
   await runProviderContract(ollama);
 
