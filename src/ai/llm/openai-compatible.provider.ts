@@ -15,6 +15,7 @@ export type OpenAiCompatibleProviderConfig = {
   defaultTemperature: number;
   defaultMaxTokens: number;
   timeoutMs: number;
+  keepAlive?: string;
   supportsStructuredOutput?: boolean;
   supportsNativeToolCalling?: boolean;
 };
@@ -48,6 +49,7 @@ export class OpenAiCompatibleProvider implements LlmProvider {
           temperature: request.temperature ?? this.config.defaultTemperature,
           max_tokens: request.maxTokens ?? this.config.defaultMaxTokens,
           messages: request.messages,
+          ...((request.keepAlive ?? this.config.keepAlive) !== undefined && this.name === "ollama" ? { keep_alive: request.keepAlive ?? this.config.keepAlive } : {}),
           ...(request.nativeTools && this.supportsNativeToolCalling ? { tools: request.nativeTools.map((tool) => ({ type: "function", function: tool })) , tool_choice: "auto" } : {}),
           ...(request.responseSchema && this.supportsStructuredOutput ? {
             response_format: {

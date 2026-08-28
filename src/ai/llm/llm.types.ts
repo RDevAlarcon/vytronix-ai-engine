@@ -20,6 +20,7 @@ export type LlmChatRequest = {
   timeoutMs?: number;
   responseSchema?: unknown;
   nativeTools?: LlmNativeTool[];
+  keepAlive?: string | number;
 };
 
 export type LlmUsage = {

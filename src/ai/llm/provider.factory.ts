@@ -19,7 +19,7 @@ export const createLlmProvider = (provider: "lmstudio" | "ollama" | "llamacpp", 
 export const createConfiguredLlmProvider = (): LlmProvider => {
   return createLlmProvider(env.LLM_PROVIDER, {
     lmstudio: { ...env.LM_STUDIO, timeoutMs: env.LLM_REQUEST_TIMEOUT_MS },
-    ollama: { ...env.OLLAMA, timeoutMs: env.LLM_REQUEST_TIMEOUT_MS },
+    ollama: { ...env.OLLAMA, timeoutMs: env.LLM_REQUEST_TIMEOUT_MS, keepAlive: env.OLLAMA_KEEP_ALIVE },
     llamacpp: { ...env.LLAMACPP, timeoutMs: env.LLM_REQUEST_TIMEOUT_MS }
   });
 };
