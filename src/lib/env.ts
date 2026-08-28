@@ -3,7 +3,7 @@ import { z } from "zod";
 const envSchema = z.object({
   NODE_ENV: z.enum(["development", "test", "production"]).default("development"),
   DATABASE_URL: z.url(),
-  LLM_PROVIDER: z.enum(["lmstudio", "ollama"]).default("lmstudio"),
+  LLM_PROVIDER: z.enum(["lmstudio", "ollama", "llamacpp"]).default("lmstudio"),
   LM_STUDIO_BASE_URL: z.url().optional(),
   LM_STUDIO_MODEL: z.string().min(1).optional(),
   LM_STUDIO_TEMPERATURE: z.coerce.number().min(0).max(2).default(0.2),
@@ -45,9 +45,14 @@ const providerConfig = parsed.data.LLM_PROVIDER === "lmstudio"
       temperature: parsed.data.LM_STUDIO_TEMPERATURE,
       maxTokens: parsed.data.LM_STUDIO_MAX_TOKENS
     }
-  : {
+  : parsed.data.LLM_PROVIDER === "ollama" ? {
       baseUrl: parsed.data.OLLAMA_BASE_URL,
       model: parsed.data.OLLAMA_MODEL,
+      temperature: parsed.data.OLLAMA_TEMPERATURE,
+      maxTokens: parsed.data.OLLAMA_MAX_TOKENS
+    } : {
+      baseUrl: parsed.data.LLAMACPP_BASE_URL,
+      model: parsed.data.LLAMACPP_MODEL,
       temperature: parsed.data.OLLAMA_TEMPERATURE,
       maxTokens: parsed.data.OLLAMA_MAX_TOKENS
     };
@@ -69,6 +74,12 @@ export const env = {
   OLLAMA: {
     baseUrl: parsed.data.OLLAMA_BASE_URL ?? "http://127.0.0.1:11434",
     model: parsed.data.OLLAMA_MODEL ?? "",
+    temperature: parsed.data.OLLAMA_TEMPERATURE,
+    maxTokens: parsed.data.OLLAMA_MAX_TOKENS
+  },
+  LLAMACPP: {
+    baseUrl: parsed.data.LLAMACPP_BASE_URL,
+    model: parsed.data.LLAMACPP_MODEL,
     temperature: parsed.data.OLLAMA_TEMPERATURE,
     maxTokens: parsed.data.OLLAMA_MAX_TOKENS
   }

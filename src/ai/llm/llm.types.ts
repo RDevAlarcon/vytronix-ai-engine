@@ -1,4 +1,4 @@
-export type LlmProviderName = "lmstudio" | "ollama";
+export type LlmProviderName = "lmstudio" | "ollama" | "llamacpp";
 
 export type ChatRole = "system" | "user" | "assistant";
 
