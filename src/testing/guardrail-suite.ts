@@ -1,4 +1,5 @@
 import { guardrailCases, type GuardrailCase } from "./guardrail-cases";
+import { assertInferenceMemoryGate, MEMORY_GATE_FAILURE } from "./memory-gate";
 
 type AgentName = "lead" | "landing" | "proposal" | "support";
 type AgentExecutionMode = "standard" | "fast";
@@ -104,6 +105,11 @@ function parseTimeoutArg(): number {
 }
 
 async function runCase(testCase: GuardrailCase, mode: AgentExecutionMode, timeoutMs: number): Promise<CaseResult> {
+  const memoryGate = assertInferenceMemoryGate();
+  if (!memoryGate.allowed) {
+    return { id: testCase.id, agent: testCase.agent, ok: false, reason: memoryGate.reason ?? MEMORY_GATE_FAILURE };
+  }
+
   const abortController = new AbortController();
   const timeoutHandle = setTimeout(() => {
     abortController.abort();
@@ -237,6 +243,10 @@ async function main() {
       console.log(
         `${marker} [${testCase.agent}] ${testCase.id} - ${testCase.description} | ${result.reason} | duration=${result.durationMs ?? "-"}ms | attempts=${result.attemptCount ?? "-"}`
       );
+      if (result.reason.includes(MEMORY_GATE_FAILURE)) {
+        console.log(MEMORY_GATE_FAILURE);
+        break;
+      }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       results.push({

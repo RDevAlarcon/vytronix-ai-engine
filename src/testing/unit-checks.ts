@@ -7,7 +7,9 @@ import { InMemoryRateLimiter } from "@/lib/rate-limiter";
 import { MAX_REQUEST_BYTES } from "@/lib/request-limits";
 import { leadInputSchema, leadOutputSchema, supportInputSchema, UNKNOWN_DETECTED_SERVICE } from "@/ai/agents/agent.schemas";
 import { runSchema } from "@/app/api/agents/run/route";
+import { assertInferenceMemoryGate, MEMORY_GATE_FAILURE } from "./memory-gate";
 import { createLlmProvider } from "@/ai/llm/provider.factory";
+import { env } from "@/lib/env";
 import type { LlmProvider } from "@/ai/llm/llm.types";
 import { benchmarkCasesSchema } from "../../benchmarks/src/types";
 import { summarizeResults, tokensPerSecond } from "../../benchmarks/src/metrics";
@@ -161,14 +163,54 @@ const main = async () => {
 
   const lmstudio = createLlmProvider("lmstudio", { lmstudio: config, ollama: config });
   const ollama = createLlmProvider("ollama", { lmstudio: config, ollama: config });
+  const llamacpp = createLlmProvider("llamacpp", {
+    lmstudio: config,
+    ollama: config,
+    llamacpp: { baseUrl: "http://127.0.0.1:18081", model: "test-model", temperature: 0, maxTokens: 550, timeoutMs: 90000 }
+  });
   assert.equal(lmstudio.name, "lmstudio");
   assert.equal(ollama.name, "ollama");
+  assert.equal(llamacpp.name, "llamacpp");
   assert.equal(ollama.supportsStructuredOutput, true);
   assert.equal(lmstudio.supportsStructuredOutput, false);
+  assert.equal(llamacpp.supportsStructuredOutput, true);
   assert.equal(ollama.supportsNativeToolCalling, true);
   assert.equal(lmstudio.supportsNativeToolCalling, false);
+  assert.equal(llamacpp.supportsNativeToolCalling, false);
+  assert.equal(env.LLAMACPP.baseUrl, "http://127.0.0.1:8081");
+  assert.equal(env.LLAMACPP.model, "granite4:3b");
   await runProviderContract(lmstudio);
   await runProviderContract(ollama);
+
+  const llamaRequests: { url: string; init: RequestInit }[] = [];
+  const originalLlamaFetch = globalThis.fetch;
+  try {
+    globalThis.fetch = async (input, init) => {
+      llamaRequests.push({ url: String(input), init: init ?? {} });
+      return response({ model: "test-model", choices: [{ message: { content: '{"status":"ok"}' }, finish_reason: "stop" }] });
+    };
+    const llamaResult = await llamacpp.chat({
+      messages: [{ role: "user", content: "hello" }],
+      responseSchema: { type: "object", properties: { status: { type: "string" } }, required: ["status"], additionalProperties: false },
+      temperature: 0,
+      maxTokens: 550
+    });
+    const llamaBody = JSON.parse(String(llamaRequests[0]?.init.body)) as Record<string, unknown>;
+    const responseFormat = llamaBody.response_format as Record<string, unknown>;
+    const jsonSchema = responseFormat.json_schema as Record<string, unknown>;
+    assert.equal(llamaRequests[0]?.url, "http://127.0.0.1:18081/v1/chat/completions");
+    assert.equal(llamaBody.model, "test-model");
+    assert.equal(llamaBody.temperature, 0);
+    assert.equal(llamaBody.max_tokens, 550);
+    assert.equal(responseFormat.type, "json_schema");
+    assert.equal(jsonSchema.name, "vytronix_output");
+    assert.equal(jsonSchema.strict, true);
+    assert.deepEqual(jsonSchema.schema, { type: "object", properties: { status: { type: "string" } }, required: ["status"], additionalProperties: false });
+    assert.equal(llamaResult.finishReason, "stop");
+    assert.deepEqual(JSON.parse(llamaResult.content), { status: "ok" });
+  } finally {
+    globalThis.fetch = originalLlamaFetch;
+  }
 
   const originalStructuredFetch = globalThis.fetch;
   const structuredRequests: string[] = [];
@@ -203,6 +245,26 @@ const main = async () => {
   }
 
   const outputSchema = z.object({ status: z.enum(["ok", "needs_info"]), count: z.number().int() });
+  let gateCalls = 0;
+  let requestCalled = false;
+  const blockedGate = assertInferenceMemoryGate(() => 1999, () => undefined);
+  if (blockedGate.allowed) requestCalled = true;
+  assert.deepEqual(blockedGate, { allowed: false, availableMb: 1999, reason: MEMORY_GATE_FAILURE });
+  assert.equal(requestCalled, false);
+  assert.equal(gateCalls, 0);
+  assert.equal(assertInferenceMemoryGate(() => 2000, () => { gateCalls += 1; }).allowed, true);
+  assert.equal(assertInferenceMemoryGate(() => 2500, () => { gateCalls += 1; }).allowed, true);
+  assert.equal(assertInferenceMemoryGate(() => 0, () => undefined).allowed, false);
+  assert.equal(assertInferenceMemoryGate(() => Number.NaN, () => undefined).allowed, false);
+  assert.equal(assertInferenceMemoryGate(() => { throw new Error("measurement failed"); }, () => undefined).allowed, false);
+  const sequence = [2600, 2300, 1999, 2500];
+  const sequenceCalls: number[] = [];
+  for (const availableMb of sequence) {
+    const gate = assertInferenceMemoryGate(() => availableMb, () => undefined);
+    if (!gate.allowed) break;
+    sequenceCalls.push(availableMb);
+  }
+  assert.deepEqual(sequenceCalls, [2600, 2300]);
   const validResponse = { content: '{"status":"ok","count":1}', model: "m", provider: "lmstudio" as const, raw: null };
   let calls = 0;
   const firstPass = await executeStructuredOutput({ baseMessages: [], schema: outputSchema, schemaDescription: z.toJSONSchema(outputSchema), generate: async () => { calls += 1; return validResponse; } });
