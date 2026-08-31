@@ -1,5 +1,23 @@
 import { z } from "zod";
 
+export const parseEnvBoolean = (value: unknown): unknown => {
+  if (value === undefined) return undefined;
+  if (typeof value === "boolean") return value;
+  if (typeof value === "number") {
+    if (value === 1) return true;
+    if (value === 0) return false;
+    return value;
+  }
+  if (typeof value !== "string") return value;
+
+  const normalized = value.trim().toLowerCase();
+  if (["true", "1"].includes(normalized)) return true;
+  if (["false", "0", ""].includes(normalized)) return false;
+  return value;
+};
+
+const envBoolean = z.preprocess((value) => parseEnvBoolean(value), z.boolean());
+
 const envSchema = z.object({
   NODE_ENV: z.enum(["development", "test", "production"]).default("development"),
   DATABASE_URL: z.url(),
@@ -16,10 +34,10 @@ const envSchema = z.object({
   LLAMACPP_BASE_URL: z.url().default("http://127.0.0.1:8081"),
   LLAMACPP_MODEL: z.string().min(1).default("granite4:3b"),
   LLM_REQUEST_TIMEOUT_MS: z.coerce.number().int().min(1000).max(120000).default(45000),
-  API_KEY_REQUIRED: z.coerce.boolean().default(false),
+  API_KEY_REQUIRED: envBoolean.default(false),
   AI_ENGINE_API_KEY: z.string().min(16).optional(),
   INTERNAL_API_KEY: z.string().min(16).optional(),
-  RATE_LIMIT_ENABLED: z.coerce.boolean().default(true),
+  RATE_LIMIT_ENABLED: envBoolean.default(true),
   RATE_LIMIT_WINDOW_MS: z.coerce.number().int().min(1000).max(600000).default(60000),
   RATE_LIMIT_MAX_REQUESTS: z.coerce.number().int().min(1).max(10000).default(60),
   INFERENCE_MIN_AVAILABLE_MEMORY_MB: z.coerce.number().int().min(1).max(1024 * 1024).default(2000),
@@ -38,7 +56,7 @@ const envSchema = z.object({
   INFERENCE_INPUT_CHARS_PER_TOKEN: z.coerce.number().int().min(1).max(20).default(3),
   INFERENCE_MAX_MESSAGES: z.coerce.number().int().min(1).max(1000).default(32),
   INFERENCE_MAX_MESSAGE_CHARS: z.coerce.number().int().min(1).max(1048576).default(3600),
-  INFERENCE_THERMAL_GATE_ENABLED: z.coerce.boolean().default(true),
+  INFERENCE_THERMAL_GATE_ENABLED: envBoolean.default(true),
   INFERENCE_THERMAL_START_C: z.coerce.number().min(0).max(125).default(65),
   INFERENCE_THERMAL_RESUME_C: z.coerce.number().min(0).max(125).default(60),
   INFERENCE_THERMAL_HARD_C: z.coerce.number().min(0).max(125).default(70),
@@ -63,66 +81,74 @@ const envSchema = z.object({
   }
 });
 
-const parsed = envSchema.safeParse(process.env);
+const parseEnvironment = (source: NodeJS.ProcessEnv) => {
+  const parsed = envSchema.safeParse(source);
 
-if (!parsed.success) {
-  const issues = parsed.error.issues
-    .map((issue) => `${issue.path.join(".")}: ${issue.message}`)
-    .join("; ");
-  throw new Error(`Invalid environment configuration: ${issues}`);
-}
+  if (!parsed.success) {
+    const issues = parsed.error.issues
+      .map((issue) => `${issue.path.join(".")}: ${issue.message}`)
+      .join("; ");
+    throw new Error(`Invalid environment configuration: ${issues}`);
+  }
 
-const configuredApiKey = parsed.data.AI_ENGINE_API_KEY ?? parsed.data.INTERNAL_API_KEY;
-const apiKeyRequired = parsed.data.NODE_ENV === "production" || parsed.data.API_KEY_REQUIRED;
+  return parsed.data;
+};
+
+export const parseEnvironmentConfigForTest = parseEnvironment;
+
+const parsedData = parseEnvironment(process.env);
+
+const configuredApiKey = parsedData.AI_ENGINE_API_KEY ?? parsedData.INTERNAL_API_KEY;
+const apiKeyRequired = parsedData.NODE_ENV === "production" || parsedData.API_KEY_REQUIRED;
 const isNextBuild = process.env.NEXT_PHASE === "phase-production-build";
 
 if (apiKeyRequired && !configuredApiKey && !isNextBuild) {
   throw new Error("Invalid environment configuration: AI_ENGINE_API_KEY is required outside development");
 }
 
-const providerConfig = parsed.data.LLM_PROVIDER === "lmstudio"
+const providerConfig = parsedData.LLM_PROVIDER === "lmstudio"
   ? {
-      baseUrl: parsed.data.LM_STUDIO_BASE_URL,
-      model: parsed.data.LM_STUDIO_MODEL,
-      temperature: parsed.data.LM_STUDIO_TEMPERATURE,
-      maxTokens: parsed.data.LM_STUDIO_MAX_TOKENS
+      baseUrl: parsedData.LM_STUDIO_BASE_URL,
+      model: parsedData.LM_STUDIO_MODEL,
+      temperature: parsedData.LM_STUDIO_TEMPERATURE,
+      maxTokens: parsedData.LM_STUDIO_MAX_TOKENS
     }
-  : parsed.data.LLM_PROVIDER === "ollama" ? {
-      baseUrl: parsed.data.OLLAMA_BASE_URL,
-      model: parsed.data.OLLAMA_MODEL,
-      temperature: parsed.data.OLLAMA_TEMPERATURE,
-      maxTokens: parsed.data.OLLAMA_MAX_TOKENS
+  : parsedData.LLM_PROVIDER === "ollama" ? {
+      baseUrl: parsedData.OLLAMA_BASE_URL,
+      model: parsedData.OLLAMA_MODEL,
+      temperature: parsedData.OLLAMA_TEMPERATURE,
+      maxTokens: parsedData.OLLAMA_MAX_TOKENS
     } : {
-      baseUrl: parsed.data.LLAMACPP_BASE_URL,
-      model: parsed.data.LLAMACPP_MODEL,
-      temperature: parsed.data.OLLAMA_TEMPERATURE,
-      maxTokens: parsed.data.OLLAMA_MAX_TOKENS
+      baseUrl: parsedData.LLAMACPP_BASE_URL,
+      model: parsedData.LLAMACPP_MODEL,
+      temperature: parsedData.OLLAMA_TEMPERATURE,
+      maxTokens: parsedData.OLLAMA_MAX_TOKENS
     };
 
 if (!providerConfig.baseUrl || !providerConfig.model) {
-  throw new Error(`Invalid environment configuration: ${parsed.data.LLM_PROVIDER} provider requires base URL and model`);
+  throw new Error(`Invalid environment configuration: ${parsedData.LLM_PROVIDER} provider requires base URL and model`);
 }
 
 export const env = {
-  ...parsed.data,
+  ...parsedData,
   API_KEY_REQUIRED: apiKeyRequired,
   AI_ENGINE_API_KEY: configuredApiKey,
   LM_STUDIO: {
-    baseUrl: parsed.data.LM_STUDIO_BASE_URL ?? "http://127.0.0.1:1234",
-    model: parsed.data.LM_STUDIO_MODEL ?? "qwen2.5-7b-instruct",
-    temperature: parsed.data.LM_STUDIO_TEMPERATURE,
-    maxTokens: parsed.data.LM_STUDIO_MAX_TOKENS
+    baseUrl: parsedData.LM_STUDIO_BASE_URL ?? "http://127.0.0.1:1234",
+    model: parsedData.LM_STUDIO_MODEL ?? "qwen2.5-7b-instruct",
+    temperature: parsedData.LM_STUDIO_TEMPERATURE,
+    maxTokens: parsedData.LM_STUDIO_MAX_TOKENS
   },
   OLLAMA: {
-    baseUrl: parsed.data.OLLAMA_BASE_URL ?? "http://127.0.0.1:11434",
-    model: parsed.data.OLLAMA_MODEL ?? "",
-    temperature: parsed.data.OLLAMA_TEMPERATURE,
-    maxTokens: parsed.data.OLLAMA_MAX_TOKENS
+    baseUrl: parsedData.OLLAMA_BASE_URL ?? "http://127.0.0.1:11434",
+    model: parsedData.OLLAMA_MODEL ?? "",
+    temperature: parsedData.OLLAMA_TEMPERATURE,
+    maxTokens: parsedData.OLLAMA_MAX_TOKENS
   },
   LLAMACPP: {
-    baseUrl: parsed.data.LLAMACPP_BASE_URL,
-    model: parsed.data.LLAMACPP_MODEL,
-    temperature: parsed.data.OLLAMA_TEMPERATURE,
-    maxTokens: parsed.data.OLLAMA_MAX_TOKENS
+    baseUrl: parsedData.LLAMACPP_BASE_URL,
+    model: parsedData.LLAMACPP_MODEL,
+    temperature: parsedData.OLLAMA_TEMPERATURE,
+    maxTokens: parsedData.OLLAMA_MAX_TOKENS
   }
 };

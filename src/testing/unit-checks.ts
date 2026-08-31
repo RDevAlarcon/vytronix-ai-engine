@@ -9,7 +9,7 @@ import { leadInputSchema, leadOutputSchema, supportInputSchema, UNKNOWN_DETECTED
 import { runSchema } from "@/app/api/agents/run/route";
 import { assertInferenceMemoryGate, MEMORY_GATE_FAILURE } from "./memory-gate";
 import { createLlmProvider } from "@/ai/llm/provider.factory";
-import { env } from "@/lib/env";
+import { env, parseEnvBoolean, parseEnvironmentConfigForTest } from "@/lib/env";
 import type { LlmProvider } from "@/ai/llm/llm.types";
 import { benchmarkCasesSchema } from "../../benchmarks/src/types";
 import { summarizeResults, tokensPerSecond } from "../../benchmarks/src/metrics";
@@ -26,6 +26,14 @@ import { assembleToolCall, buildToolAwareSchema, buildToolAwareSystemPrompt, bui
 const config = { baseUrl: "http://provider.test", model: "test-model", temperature: 0.2, maxTokens: 120, timeoutMs: 100, keepAlive: "10m" };
 
 const response = (payload: unknown, ok = true) => ({ ok, json: async () => payload }) as Response;
+
+const baseTestEnv = {
+  NODE_ENV: "development",
+  DATABASE_URL: "postgres://user:password@localhost:5432/vytronix",
+  LLM_PROVIDER: "lmstudio",
+  LM_STUDIO_BASE_URL: "http://127.0.0.1:1234",
+  LM_STUDIO_MODEL: "test-model"
+} satisfies NodeJS.ProcessEnv;
 
 const runProviderContract = async (provider: LlmProvider): Promise<void> => {
   const originalFetch = globalThis.fetch;
@@ -52,6 +60,37 @@ const main = async () => {
   assert.equal(isApiKeyValid("correct-key", "correct-key"), true);
   assert.equal(isApiKeyValid("wrong-key", "correct-key"), false);
   assert.equal(isApiKeyValid(null, "correct-key"), false);
+  assert.equal(parseEnvBoolean("false"), false);
+  assert.equal(parseEnvBoolean("true"), true);
+  assert.equal(parseEnvBoolean("0"), false);
+  assert.equal(parseEnvBoolean("1"), true);
+  assert.equal(parseEnvBoolean(""), false);
+  assert.equal(parseEnvBoolean(undefined), undefined);
+  assert.equal(parseEnvBoolean(true), true);
+  assert.equal(parseEnvBoolean(false), false);
+  assert.equal(parseEnvBoolean(1), true);
+  assert.equal(parseEnvBoolean(0), false);
+  assert.equal(parseEnvBoolean("yes"), "yes");
+  assert.equal(parseEnvBoolean("no"), "no");
+  assert.equal(parseEnvBoolean("TRUEE"), "TRUEE");
+  assert.equal(parseEnvBoolean("flase"), "flase");
+  assert.equal(parseEnvBoolean(2), 2);
+  assert.equal(parseEnvBoolean(-1), -1);
+  assert.equal(parseEnvironmentConfigForTest({ ...baseTestEnv, API_KEY_REQUIRED: "false" }).API_KEY_REQUIRED, false);
+  assert.equal(parseEnvironmentConfigForTest({ ...baseTestEnv, API_KEY_REQUIRED: "true" }).API_KEY_REQUIRED, true);
+  assert.equal(parseEnvironmentConfigForTest({ ...baseTestEnv, RATE_LIMIT_ENABLED: "false" }).RATE_LIMIT_ENABLED, false);
+  assert.equal(parseEnvironmentConfigForTest({ ...baseTestEnv, INFERENCE_THERMAL_GATE_ENABLED: "false" }).INFERENCE_THERMAL_GATE_ENABLED, false);
+  const defaultBooleanConfig = parseEnvironmentConfigForTest(baseTestEnv);
+  assert.equal(defaultBooleanConfig.API_KEY_REQUIRED, false);
+  assert.equal(defaultBooleanConfig.RATE_LIMIT_ENABLED, true);
+  assert.equal(defaultBooleanConfig.INFERENCE_THERMAL_GATE_ENABLED, true);
+  assert.throws(() => parseEnvironmentConfigForTest({ ...baseTestEnv, API_KEY_REQUIRED: "flase" }));
+  assert.throws(() => parseEnvironmentConfigForTest({ ...baseTestEnv, RATE_LIMIT_ENABLED: "yes" }));
+  assert.throws(() => parseEnvironmentConfigForTest({ ...baseTestEnv, INFERENCE_THERMAL_GATE_ENABLED: "disabled" }));
+  assert.throws(() => parseEnvironmentConfigForTest({ ...baseTestEnv, API_KEY_REQUIRED: "no" }));
+  assert.throws(() => parseEnvironmentConfigForTest({ ...baseTestEnv, API_KEY_REQUIRED: "TRUEE" }));
+  assert.throws(() => parseEnvironmentConfigForTest({ ...baseTestEnv, API_KEY_REQUIRED: "2" }));
+  assert.throws(() => parseEnvironmentConfigForTest({ ...baseTestEnv, API_KEY_REQUIRED: "-1" }));
 
   const limiter = new InMemoryRateLimiter(1000, 2);
   assert.equal(limiter.consume("client", 0), true);
