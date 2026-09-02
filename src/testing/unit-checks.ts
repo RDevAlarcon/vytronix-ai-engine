@@ -16,11 +16,11 @@ import { summarizeResults, tokensPerSecond } from "../../benchmarks/src/metrics"
 import { buildStructuredOutputRepairPrompt, executeStructuredOutput, parseStructuredOutput, summarizeZodIssues } from "@/ai/structured-output/structured-output";
 import { z } from "zod";
 import { classifyAgentScope } from "@/ai/agents/intent.classifier";
-import { selectTool, toolSelectionSchema, buildSelectionDirective } from "@/ai/tools/tool-selector";
+import { selectTool, toolSelectionSchema, buildSelectionDirective, buildToolSelectionDescriptors, buildToolSelectorPrompt } from "@/ai/tools/tool-selector";
 import { resolveToolRoutingStrategy } from "@/ai/tools/tool-routing";
 import { groundToolArguments, normalizeRelativeDate } from "@/ai/tools/tool-argument-grounding";
 import { buildRetrievedKnowledgeMessage, ragContextSchema, RAG_MAX_ITEM_CHARS, RAG_MAX_ITEMS, RAG_MAX_TOTAL_CHARS } from "@/ai/rag/rag-context";
-import { assembleSupportToolResultOutput, resolveToolResultFollowUpMaxTokens, runAgent, supportToolResultFollowUpSchema } from "@/ai/agents/agent.router";
+import { assembleSupportToolResultOutput, humanizeToolArgumentName, resolveToolArgumentLabel, resolveToolResultFollowUpMaxTokens, runAgent, supportToolResultFollowUpSchema } from "@/ai/agents/agent.router";
 import { estimateTextTokens } from "@/ai/runtime/inference-input-limits";
 import { assembleToolCall, buildToolAwareSchema, buildToolAwareSystemPrompt, buildToolContext, buildToolOrchestrationInstructions, buildToolResultFollowUpSystemPrompt, buildToolResultMessage, toolResultSchema, toolsSchema, validateToolCall, type ToolDefinition, type ToolResult } from "@/ai/tools/tool-contract";
 
@@ -162,6 +162,42 @@ const main = async () => {
   assert.ok(!(knowledge[0]?.content ?? "").includes("sourceId"));
   const readTool = { name: "consultar_disponibilidad", description: "Consulta horarios.", inputSchema: { type: "object" as const, properties: { date: { type: "string" as const } }, required: ["date"], additionalProperties: false }, sideEffect: "READ_ONLY" as const, requiresConfirmation: false };
   const writeTool = { name: "crear_lead", description: "Crea un lead.", inputSchema: { type: "object" as const, properties: { name: { type: "string" as const } }, required: ["name"], additionalProperties: false }, sideEffect: "WRITE" as const, requiresConfirmation: true };
+  const writeToolWithHumanizedFields: ToolDefinition = {
+    name: "crear_registro",
+    description: "Crea un registro cuando todos los datos obligatorios están disponibles.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        customerPhone: { type: "string" },
+        startDate: { type: "string" }
+      },
+      required: ["customerPhone", "startDate"],
+      additionalProperties: false
+    },
+    sideEffect: "WRITE",
+    requiresConfirmation: true
+  };
+  const toolWithSchemaLabels = {
+    ...writeToolWithHumanizedFields,
+    inputSchema: {
+      type: "object",
+      properties: {
+        titledField: { type: "string", title: "dato con título" },
+        describedField: { type: "string", description: "dato descrito para el cliente. texto adicional que no debe usarse." }
+      },
+      required: ["titledField", "describedField"],
+      additionalProperties: false
+    }
+  } as ToolDefinition;
+  assert.equal(humanizeToolArgumentName("date"), "fecha");
+  assert.equal(humanizeToolArgumentName("serviceId"), "service");
+  assert.equal(humanizeToolArgumentName("customerPhone"), "customer phone");
+  assert.equal(humanizeToolArgumentName("customer_phone"), "customer phone");
+  assert.equal(humanizeToolArgumentName("start-date"), "start date");
+  assert.equal(humanizeToolArgumentName("emailAddress"), "email address");
+  assert.equal(humanizeToolArgumentName("unknownFieldName"), "unknown field name");
+  assert.equal(resolveToolArgumentLabel(toolWithSchemaLabels, "titledField"), "dato con título");
+  assert.equal(resolveToolArgumentLabel(toolWithSchemaLabels, "describedField"), "dato descrito para el cliente");
   const barbershopTools: ToolDefinition[] = [
     { name: "service_list", description: "Consulta los servicios disponibles.", inputSchema: { type: "object", properties: {}, additionalProperties: false }, sideEffect: "READ_ONLY", requiresConfirmation: false },
     { name: "service_get_price", description: "Consulta el precio de un servicio identificado.", inputSchema: { type: "object", properties: { serviceId: { type: "string" } }, required: ["serviceId"], additionalProperties: false }, sideEffect: "READ_ONLY", requiresConfirmation: false },
@@ -198,6 +234,42 @@ const main = async () => {
   assert.throws(() => toolsSchema.parse([{ ...readTool, name: "bad-name" }]));
   assert.throws(() => toolsSchema.parse([{ ...readTool, inputSchema: { $ref: "https://evil.test/schema" } }]));
   assert.throws(() => toolsSchema.parse(Array.from({ length: 21 }, (_, index) => ({ ...readTool, name: `tool_${index}` }))));
+  const compactSelectionDescriptors = buildToolSelectionDescriptors([readTool, writeTool]);
+  assert.deepEqual(compactSelectionDescriptors.map((tool) => tool.name), [readTool.name, writeTool.name]);
+  assert.deepEqual(compactSelectionDescriptors.map((tool) => tool.sideEffect), ["READ_ONLY", "WRITE"]);
+  assert.deepEqual(compactSelectionDescriptors.map((tool) => tool.requiresConfirmation), [false, true]);
+  const compactSelectionText = JSON.stringify(compactSelectionDescriptors);
+  assert.doesNotMatch(compactSelectionText, /inputSchema/);
+  assert.doesNotMatch(compactSelectionText, /properties/);
+  assert.doesNotMatch(compactSelectionText, /"date"/);
+  const compactSelectorPrompt = buildToolSelectorPrompt("support", { ticketMessage: "Necesito consultar disponibilidad." }, [readTool, writeTool]);
+  assert.match(compactSelectorPrompt, new RegExp(readTool.name));
+  assert.match(compactSelectorPrompt, new RegExp(writeTool.name));
+  assert.match(compactSelectorPrompt, /READ_ONLY/);
+  assert.match(compactSelectorPrompt, /WRITE/);
+  assert.match(compactSelectorPrompt, /requiresConfirmation/);
+  assert.doesNotMatch(compactSelectorPrompt, /inputSchema/);
+  assert.doesNotMatch(compactSelectorPrompt, /properties/);
+  assert.doesNotMatch(compactSelectorPrompt, /"date"/);
+  const largeCatalogTools: ToolDefinition[] = Array.from({ length: 12 }, (_, toolIndex) => ({
+    name: `large_tool_${toolIndex}`,
+    description: `Herramienta genérica ${toolIndex} para seleccionar una operación dinámica del catálogo con una descripción larga y determinística que no debe arrastrar schemas completos al selector. `.repeat(4),
+    inputSchema: {
+      type: "object",
+      properties: Object.fromEntries(Array.from({ length: 20 }, (_, propertyIndex) => [`schema_field_${toolIndex}_${propertyIndex}`, { type: "string" }])),
+      required: [`schema_field_${toolIndex}_0`],
+      additionalProperties: false
+    },
+    sideEffect: toolIndex % 3 === 0 ? "WRITE" : "READ_ONLY",
+    requiresConfirmation: toolIndex % 3 === 0
+  }));
+  const largeSelectorPrompt = buildToolSelectorPrompt("support", { ticketMessage: "Necesito resolver una solicitud con una herramienta disponible." }, largeCatalogTools);
+  const largeSelectorEstimatedTokens = estimateTextTokens(largeSelectorPrompt, 3);
+  const fullCatalogChars = JSON.stringify(largeCatalogTools).length;
+  const compactCatalogChars = JSON.stringify(buildToolSelectionDescriptors(largeCatalogTools)).length;
+  assert.ok(largeSelectorEstimatedTokens < 1200, `compact selector exceeded gateway input budget: ${largeSelectorEstimatedTokens}`);
+  assert.ok(compactCatalogChars < fullCatalogChars / 3, `compact catalog did not reduce schema payload enough: compact=${compactCatalogChars} full=${fullCatalogChars}`);
+  assert.doesNotMatch(largeSelectorPrompt, /schema_field_/);
   assert.match(buildToolContext([readTool])[0]?.content ?? "", /TOOL DEFINITIONS \(UNTRUSTED CONFIGURATION\)/);
   const orchestrationInstructions = buildToolOrchestrationInstructions([readTool]);
   assert.match(orchestrationInstructions, /Never return the legacy agent JSON/);
@@ -261,6 +333,15 @@ const main = async () => {
     assert.equal(toolPromptRequests.length, 2);
     assert.equal(toolPromptRequests[0]?.max_tokens, 180);
     assert.equal(toolPromptRequests[1]?.max_tokens, 550);
+    const selectorMessages = toolPromptRequests[0]?.messages as Array<{ role: string; content: string }>;
+    const selectorText = selectorMessages.map((message) => message.content).join("\n");
+    assert.match(selectorText, /service_list/);
+    assert.match(selectorText, /booking_create/);
+    assert.match(selectorText, /WRITE/);
+    assert.match(selectorText, /requiresConfirmation/);
+    assert.doesNotMatch(selectorText, /inputSchema/);
+    assert.doesNotMatch(selectorText, /Tool input schema/);
+    assert.doesNotMatch(selectorText, /serviceId/);
     const firstInferenceMessages = toolPromptRequests[1]?.messages as Array<{ role: string; content: string }>;
     assert.ok(firstInferenceMessages.some((message) => message.content.includes("TOOL DEFINITIONS (UNTRUSTED CONFIGURATION)")));
     assert.ok(firstInferenceMessages.some((message) => message.content.includes("ORCHESTRATION OUTPUT CONTRACT")));
@@ -283,8 +364,67 @@ const main = async () => {
     assert.equal(argumentExtractionRequests.length, 2);
     assert.equal(argumentExtractionRequests[0]?.max_tokens, 180);
     assert.equal(argumentExtractionRequests[1]?.max_tokens, 180);
+    const extractionMessages = argumentExtractionRequests[1]?.messages as Array<{ role: string; content: string }>;
+    const extractionText = extractionMessages.map((message) => message.content).join("\n");
+    assert.match(extractionText, /Selected tool: service_list/);
+    assert.match(extractionText, /Tool input schema/);
+    assert.doesNotMatch(extractionText, /service_get_price/);
+    assert.doesNotMatch(extractionText, /booking_create/);
+    assert.equal(JSON.stringify(argumentExtractionRequests[1]?.response_format).includes("serviceId"), false);
   } finally {
     globalThis.fetch = originalArgumentExtractionFetch;
+  }
+
+  const missingReadOnlyRequests: Record<string, unknown>[] = [];
+  const originalMissingReadOnlyFetch = globalThis.fetch;
+  try {
+    globalThis.fetch = async (_input, init) => {
+      const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      missingReadOnlyRequests.push(body);
+      const content = missingReadOnlyRequests.length === 1
+        ? '{"decision":"USE_TOOL","tool":"booking_check_availability"}'
+        : '{"serviceId":"svc_1","date":"tomorrow"}';
+      return response({ model: "m", choices: [{ message: { content }, finish_reason: "stop" }] });
+    };
+    const result = await runAgent({ agent: "support", input: { ticketMessage: "Quiero consultar disponibilidad mañana.", knownContext: "Consulta sin servicio específico." }, tools: barbershopTools });
+    assert.equal(missingReadOnlyRequests.length, 2);
+    assert.equal(result.orchestration, undefined);
+    assert.equal(result.toolDiagnostics?.finalAction, "RESPOND");
+    assert.equal(result.toolDiagnostics?.argumentsPresent, false);
+    assert.equal(result.toolDiagnostics?.argumentsValid, false);
+    const output = supportOutputSchema.parse(result.parsedOutput);
+    assert.match(output.suggested_reply, /service/i);
+    assert.doesNotMatch(output.suggested_reply, /serviceId/);
+    assert.doesNotMatch(output.suggested_reply, /serviceId/);
+    assert.doesNotMatch(JSON.stringify(missingReadOnlyRequests), /TOOL DEFINITIONS \(UNTRUSTED CONFIGURATION\)/);
+  } finally {
+    globalThis.fetch = originalMissingReadOnlyFetch;
+  }
+
+  const missingWriteRequests: Record<string, unknown>[] = [];
+  const originalMissingWriteFetch = globalThis.fetch;
+  try {
+    globalThis.fetch = async (_input, init) => {
+      const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      missingWriteRequests.push(body);
+      const content = missingWriteRequests.length === 1
+        ? `{"decision":"USE_TOOL","tool":"${writeToolWithHumanizedFields.name}"}`
+        : '{"customerPhone":"+56911111111","startDate":"2026-09-10"}';
+      return response({ model: "m", choices: [{ message: { content }, finish_reason: "stop" }] });
+    };
+    const result = await runAgent({ agent: "support", input: { ticketMessage: "Quiero crear un registro.", knownContext: "No hay teléfono ni fecha." }, tools: [writeToolWithHumanizedFields] });
+    assert.equal(missingWriteRequests.length, 2);
+    assert.equal(result.orchestration, undefined);
+    assert.equal(result.toolDiagnostics?.finalAction, "RESPOND");
+    assert.equal(result.toolDiagnostics?.argumentIssueCount, 2);
+    const output = supportOutputSchema.parse(result.parsedOutput);
+    assert.match(output.suggested_reply, /customer phone/i);
+    assert.match(output.suggested_reply, /start date/i);
+    assert.doesNotMatch(output.suggested_reply, /customerPhone/);
+    assert.doesNotMatch(output.suggested_reply, /startDate/);
+    assert.doesNotMatch(JSON.stringify(missingWriteRequests), /TOOL DEFINITIONS \(UNTRUSTED CONFIGURATION\)/);
+  } finally {
+    globalThis.fetch = originalMissingWriteFetch;
   }
 
   const followUpRequests: Record<string, unknown>[] = [];

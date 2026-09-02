@@ -35,7 +35,8 @@ import {
   toolResultSchema,
   toolsSchema,
   validateToolCall,
-  type ToolAwareOutput
+  type ToolAwareOutput,
+  type ToolDefinition
 } from "@/ai/tools/tool-contract";
 
 const runRequestSchema = z.object({
@@ -100,6 +101,77 @@ export const assembleSupportToolResultOutput = (output: SupportToolResultFollowU
   out_of_scope_reason: null,
   safe_reply: output.suggested_reply
 });
+
+const UNIVERSAL_ARGUMENT_LABELS: Record<string, string> = {
+  date: "fecha",
+  time: "hora",
+  email: "correo electrónico",
+  phone: "teléfono",
+  name: "nombre",
+  address: "dirección"
+};
+
+const ARGUMENT_ARTICLES: Record<string, string> = {
+  dirección: "la",
+  fecha: "la",
+  hora: "la"
+};
+
+export const humanizeToolArgumentName = (field: string): string => {
+  const normalized = field.trim();
+  const normalizedKey = normalized
+    .replace(/([a-z0-9])([A-Z])/gu, "$1_$2")
+    .replace(/[-\s]+/gu, "_")
+    .toLocaleLowerCase("es");
+  const withoutIdSuffix = normalizedKey.replace(/_?id$/u, "");
+  if (UNIVERSAL_ARGUMENT_LABELS[withoutIdSuffix]) return UNIVERSAL_ARGUMENT_LABELS[withoutIdSuffix];
+  return withoutIdSuffix
+    .replace(/_/gu, " ")
+    .replace(/([a-z0-9])([A-Z])/gu, "$1 $2")
+    .trim()
+    .toLocaleLowerCase("es");
+};
+
+const compactSchemaDescriptionLabel = (description: string): string | null => {
+  const firstSentence = description.replace(/\s+/gu, " ").trim().split(/[.!?]/u)[0]?.trim();
+  if (!firstSentence || firstSentence.length > 80) return null;
+  return firstSentence;
+};
+
+export const resolveToolArgumentLabel = (tool: ToolDefinition, field: string): string => {
+  const property = tool.inputSchema.properties?.[field] as { title?: unknown; description?: unknown } | undefined;
+  if (typeof property?.title === "string" && property.title.trim()) return property.title.trim();
+  if (typeof property?.description === "string" && property.description.trim()) {
+    const label = compactSchemaDescriptionLabel(property.description);
+    if (label) return label;
+  }
+  return humanizeToolArgumentName(field);
+};
+
+const formatMissingToolArguments = (labels: string[]): string => {
+  const withArticles = labels.map((label) => `${ARGUMENT_ARTICLES[label] ?? "el"} ${label}`);
+  if (withArticles.length === 0) return "el dato faltante";
+  if (withArticles.length === 1) return withArticles[0] ?? "el dato faltante";
+  return `${withArticles.slice(0, -1).join(", ")} y ${withArticles.at(-1)}`;
+};
+
+const assembleSupportToolClarificationOutput = (tool: ToolDefinition, fields: string[]) => {
+  const uniqueFields = [...new Set(fields)].filter(Boolean);
+  const labels = uniqueFields.map((field) => resolveToolArgumentLabel(tool, field));
+  const requestedFields = formatMissingToolArguments(labels);
+  const suggestedReply = `Para continuar necesito que me indiques ${requestedFields}.`;
+
+  return supportAgent.outputSchema.parse({
+    category: "general",
+    priority: "low",
+    summary: "Faltan datos para continuar con la solicitud.",
+    suggested_reply: suggestedReply,
+    escalate_to_human: false,
+    is_in_scope: true,
+    out_of_scope_reason: null,
+    safe_reply: suggestedReply
+  });
+};
 
 const resolveTemperature = (
   mode: AgentExecutionMode,
@@ -255,6 +327,39 @@ export const runAgent = async (request: AgentRunRequest): Promise<AgentRunResult
       structuredOutputUsed: llmService.supportsStructuredOutput,
       orchestration: { ...assembledCall, toolCall: { ...assembledCall.toolCall, toolCallId: randomUUID() } }
     };
+  }
+  if (toolSelection?.decision.decision === "USE_TOOL" && toolSelection.selectedTool && argumentExtraction && parsedRequest.agent === "support") {
+    const missingArguments = argumentExtraction.status === "MISSING_INFORMATION"
+      ? argumentExtraction.missing ?? []
+      : groundedArguments && groundedArguments.status !== "READY"
+      ? [...groundedArguments.missing, ...groundedArguments.ungrounded]
+      : [];
+    if (missingArguments.length > 0) {
+      const totalDurationMs = Date.now() - startedAt;
+      const output = assembleSupportToolClarificationOutput(toolSelection.selectedTool, missingArguments);
+      return {
+        agent: parsedRequest.agent,
+        mode: effectiveMode,
+        parsedOutput: output,
+        rawOutput: JSON.stringify(output),
+        model: process.env.LLAMACPP_MODEL ?? process.env.OLLAMA_MODEL ?? process.env.LM_STUDIO_MODEL ?? "configured-model",
+        provider: process.env.LLM_PROVIDER ?? "configured-provider",
+        attemptCount: argumentExtraction.attempts,
+        repairAttempt: argumentExtraction.repairAttempt,
+        durationMs: totalDurationMs,
+        totalDurationMs,
+        agentDurationMs: 0,
+        toolSelection: { selectorUsed: true, selectorSkipped: false, selectorDecision: "USE_TOOL", selectedToolName: toolSelection.selectedTool.name, selectorAttempts: toolSelection.attempts, selectorRepair: toolSelection.repairAttempt, selectorValid: true, selectorDurationMs: toolSelection.durationMs, diagnostics: toolSelection.diagnostics },
+        toolDiagnostics: { finalAction: "RESPOND", enforcementPassed: true, argumentsPresent: false, argumentsValid: false, argumentIssueCount: missingArguments.length },
+        structuredOutputRequested: true,
+        structuredOutputProviderSupported: llmService.supportsStructuredOutput,
+        structuredOutputMode: llmService.supportsStructuredOutput ? "NATIVE_SCHEMA" : "TEXT_FALLBACK",
+        toolRoutingStrategy: routingStrategy,
+        nativePathUsed: false,
+        selectorPathUsed: true,
+        structuredOutputUsed: llmService.supportsStructuredOutput
+      };
+    }
   }
   const enforcedToolSelection = groundedArguments && groundedArguments.status !== "READY" ? null : toolSelection;
   const domainOnlyResponse = !nativeToolCalling && (
