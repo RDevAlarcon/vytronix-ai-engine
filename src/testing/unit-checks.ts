@@ -5,7 +5,7 @@ import { isApiKeyValid } from "@/lib/api-guard";
 import { toPublicError, AppError } from "@/lib/errors";
 import { InMemoryRateLimiter } from "@/lib/rate-limiter";
 import { MAX_REQUEST_BYTES } from "@/lib/request-limits";
-import { leadInputSchema, leadOutputSchema, supportInputSchema, UNKNOWN_DETECTED_SERVICE } from "@/ai/agents/agent.schemas";
+import { leadInputSchema, leadOutputSchema, supportInputSchema, supportOutputSchema, UNKNOWN_DETECTED_SERVICE } from "@/ai/agents/agent.schemas";
 import { runSchema } from "@/app/api/agents/run/route";
 import { assertInferenceMemoryGate, MEMORY_GATE_FAILURE } from "./memory-gate";
 import { createLlmProvider } from "@/ai/llm/provider.factory";
@@ -20,12 +20,23 @@ import { selectTool, toolSelectionSchema, buildSelectionDirective } from "@/ai/t
 import { resolveToolRoutingStrategy } from "@/ai/tools/tool-routing";
 import { groundToolArguments, normalizeRelativeDate } from "@/ai/tools/tool-argument-grounding";
 import { buildRetrievedKnowledgeMessage, ragContextSchema, RAG_MAX_ITEM_CHARS, RAG_MAX_ITEMS, RAG_MAX_TOTAL_CHARS } from "@/ai/rag/rag-context";
-import { runAgent } from "@/ai/agents/agent.router";
-import { assembleToolCall, buildToolAwareSchema, buildToolAwareSystemPrompt, buildToolContext, buildToolOrchestrationInstructions, buildToolResultMessage, toolResultSchema, toolsSchema, validateToolCall } from "@/ai/tools/tool-contract";
+import { assembleSupportToolResultOutput, resolveToolResultFollowUpMaxTokens, runAgent, supportToolResultFollowUpSchema } from "@/ai/agents/agent.router";
+import { estimateTextTokens } from "@/ai/runtime/inference-input-limits";
+import { assembleToolCall, buildToolAwareSchema, buildToolAwareSystemPrompt, buildToolContext, buildToolOrchestrationInstructions, buildToolResultFollowUpSystemPrompt, buildToolResultMessage, toolResultSchema, toolsSchema, validateToolCall, type ToolDefinition, type ToolResult } from "@/ai/tools/tool-contract";
 
 const config = { baseUrl: "http://provider.test", model: "test-model", temperature: 0.2, maxTokens: 120, timeoutMs: 100, keepAlive: "10m" };
 
 const response = (payload: unknown, ok = true) => ({ ok, json: async () => payload }) as Response;
+const validSupportOutput = {
+  category: "general",
+  priority: "low",
+  summary: "Solicitud de servicios disponibles.",
+  suggested_reply: "La barbería ofrece servicios disponibles en el catálogo consultado.",
+  escalate_to_human: false,
+  is_in_scope: true,
+  out_of_scope_reason: null,
+  safe_reply: "La barbería ofrece servicios disponibles en el catálogo consultado."
+};
 
 const baseTestEnv = {
   NODE_ENV: "development",
@@ -113,7 +124,14 @@ const main = async () => {
 
   const originalAgentFetch = globalThis.fetch;
   try {
-    globalThis.fetch = async () => response({ choices: [{ message: { content: JSON.stringify({ category: "general", priority: "low", summary: "Solicitud recibida.", suggested_reply: "Indica qué necesitas.", escalate_to_human: false, is_in_scope: true, out_of_scope_reason: null, safe_reply: "Indica qué necesitas." }) } }] });
+    globalThis.fetch = async (_input, init) => {
+      const body = JSON.parse(String(init?.body)) as { response_format?: { json_schema?: { schema?: { properties?: Record<string, unknown> } } } };
+      const properties = Object.keys(body.response_format?.json_schema?.schema?.properties ?? {});
+      const content = properties.length === 1 && properties[0] === "suggested_reply"
+        ? JSON.stringify({ suggested_reply: "Indica qué necesitas." })
+        : JSON.stringify({ category: "general", priority: "low", summary: "Solicitud recibida.", suggested_reply: "Indica qué necesitas.", escalate_to_human: false, is_in_scope: true, out_of_scope_reason: null, safe_reply: "Indica qué necesitas." });
+      return response({ choices: [{ message: { content } }] });
+    };
     const nonGreeting = await runAgent({ agent: "support", input: { ticketMessage: "Necesito orientación general sobre cómo solicitar ayuda." } });
     assert.notEqual(nonGreeting.model, "deterministic-greeting");
     assert.notEqual(nonGreeting.provider, "internal");
@@ -144,6 +162,29 @@ const main = async () => {
   assert.ok(!(knowledge[0]?.content ?? "").includes("sourceId"));
   const readTool = { name: "consultar_disponibilidad", description: "Consulta horarios.", inputSchema: { type: "object" as const, properties: { date: { type: "string" as const } }, required: ["date"], additionalProperties: false }, sideEffect: "READ_ONLY" as const, requiresConfirmation: false };
   const writeTool = { name: "crear_lead", description: "Crea un lead.", inputSchema: { type: "object" as const, properties: { name: { type: "string" as const } }, required: ["name"], additionalProperties: false }, sideEffect: "WRITE" as const, requiresConfirmation: true };
+  const barbershopTools: ToolDefinition[] = [
+    { name: "service_list", description: "Consulta los servicios disponibles.", inputSchema: { type: "object", properties: {}, additionalProperties: false }, sideEffect: "READ_ONLY", requiresConfirmation: false },
+    { name: "service_get_price", description: "Consulta el precio de un servicio identificado.", inputSchema: { type: "object", properties: { serviceId: { type: "string" } }, required: ["serviceId"], additionalProperties: false }, sideEffect: "READ_ONLY", requiresConfirmation: false },
+    { name: "booking_check_availability", description: "Consulta horarios disponibles para un servicio y fecha.", inputSchema: { type: "object", properties: { serviceId: { type: "string" }, resourceId: { type: "string" }, date: { type: "string" } }, required: ["serviceId", "date"], additionalProperties: false }, sideEffect: "READ_ONLY", requiresConfirmation: false },
+    { name: "booking_get", description: "Consulta una reserva existente.", inputSchema: { type: "object", properties: { bookingId: { type: "string" } }, required: ["bookingId"], additionalProperties: false }, sideEffect: "READ_ONLY", requiresConfirmation: false },
+    { name: "booking_create", description: "Crea una reserva con datos validados del cliente.", inputSchema: { type: "object", properties: { serviceId: { type: "string" }, resourceId: { type: "string" }, startAt: { type: "string" }, customerName: { type: "string" } }, required: ["serviceId", "resourceId", "startAt", "customerName"], additionalProperties: false }, sideEffect: "WRITE", requiresConfirmation: true },
+    { name: "booking_cancel", description: "Cancela una reserva existente.", inputSchema: { type: "object", properties: { bookingId: { type: "string" } }, required: ["bookingId"], additionalProperties: false }, sideEffect: "WRITE", requiresConfirmation: true }
+  ];
+  const barbershopToolResult: ToolResult = {
+    toolCallId: "service-list-1",
+    toolName: "service_list",
+    status: "SUCCEEDED",
+    output: {
+      items: [
+        { serviceId: "svc_1", name: "Corte de cabello", description: "Corte clásico o moderno con asesoría de estilo.", durationMinutes: 30, priceAmount: 12000, currency: "CLP", category: "hair", metadata: { bookingRequired: true, visible: true } },
+        { serviceId: "svc_2", name: "Perfilado de barba", description: "Diseño y mantención de barba con terminación de navaja.", durationMinutes: 20, priceAmount: 9000, currency: "CLP", category: "beard", metadata: { bookingRequired: true, visible: true } },
+        { serviceId: "svc_3", name: "Corte y barba", description: "Servicio combinado para cabello y barba en una misma atención.", durationMinutes: 45, priceAmount: 18000, currency: "CLP", category: "combo", metadata: { bookingRequired: true, visible: true } },
+        { serviceId: "svc_4", name: "Afeitado clásico", description: "Afeitado tradicional con paños calientes y productos de cuidado.", durationMinutes: 30, priceAmount: 11000, currency: "CLP", category: "beard", metadata: { bookingRequired: true, visible: true } },
+        { serviceId: "svc_5", name: "Lavado y peinado", description: "Lavado capilar y peinado de terminación para evento o rutina.", durationMinutes: 15, priceAmount: 7000, currency: "CLP", category: "hair", metadata: { bookingRequired: false, visible: true } },
+        { serviceId: "svc_6", name: "Corte infantil", description: "Corte para niños con atención rápida y cuidadosa.", durationMinutes: 25, priceAmount: 10000, currency: "CLP", category: "hair", metadata: { bookingRequired: true, visible: true } }
+      ]
+    }
+  };
   assert.equal(resolveToolRoutingStrategy({ tools: [readTool], supportsNativeToolCalling: true }), "NATIVE");
   assert.equal(resolveToolRoutingStrategy({ tools: [readTool], ragContext: { items: [{ content: "price" }] }, supportsNativeToolCalling: true }), "SELECTOR");
   assert.equal(resolveToolRoutingStrategy({ tools: [readTool], ragContext: { items: [] }, supportsNativeToolCalling: true }), "NATIVE");
@@ -176,6 +217,12 @@ const main = async () => {
   assert.doesNotMatch(toolsSystem, /Required JSON shape/);
   assert.match(toolsSystem, /complete schema for RESPOND\.result/);
   assert.match(buildToolAwareSystemPrompt(legacySystem, [readTool], { toolCallId: "call_1", toolName: readTool.name, status: "SUCCEEDED", output: { available: true } }), /MUST return action RESPOND/);
+  const toolResultSystem = buildToolResultFollowUpSystemPrompt(legacySystem, { toolCallId: "call_1", toolName: readTool.name, status: "SUCCEEDED", output: { available: true } }, { type: "object", required: ["category", "safe_reply"] });
+  assert.match(toolResultSystem, /TOOL RESULT FOLLOW-UP/);
+  assert.match(toolResultSystem, /Return only the final RESPOND\/domain JSON object/);
+  assert.doesNotMatch(toolResultSystem, /Allowed tool names/);
+  assert.doesNotMatch(toolResultSystem, /"action":"CALL_TOOL"/);
+  assert.ok(toolResultSystem.length <= 900, `compact follow-up system prompt is too large: ${toolResultSystem.length}`);
   assert.match(buildToolResultMessage({ toolCallId: "call_1", toolName: readTool.name, status: "SUCCEEDED", output: { available: true } })[0]?.content ?? "", /TOOL RESULT \(UNTRUSTED DATA\)/);
   const toolResultBoundary = buildToolResultMessage({ toolCallId: "call_1", toolName: readTool.name, status: "SUCCEEDED", output: { available: true } })[0]?.content ?? "";
   assert.ok(toolResultBoundary.indexOf("<tool_result>") < toolResultBoundary.indexOf("</tool_result>"));
@@ -197,6 +244,107 @@ const main = async () => {
   const toolAware = buildToolAwareSchema(z.object({ ok: z.boolean() }));
   assert.equal(toolAware.parse({ action: "RESPOND", result: { ok: true } }).action, "RESPOND");
   assert.throws(() => toolAware.parse({ action: "RESPOND", result: { ok: true }, reasoning: "secret" }));
+  await assert.rejects(() => runAgent({ agent: "support", input: { ticketMessage: "Necesito ver los servicios disponibles." }, tools: [readTool], toolResult: { toolCallId: "call_1", toolName: "service_list", status: "SUCCEEDED", output: {} } }), (error: unknown) => error instanceof AppError && error.code === "TOOL_RESULT_INVALID");
+
+  const toolPromptRequests: Record<string, unknown>[] = [];
+  const originalToolPromptFetch = globalThis.fetch;
+  try {
+    globalThis.fetch = async (_input, init) => {
+      const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      toolPromptRequests.push(body);
+      const content = toolPromptRequests.length === 1
+        ? '{"decision":"NO_TOOL"}'
+        : JSON.stringify(validSupportOutput);
+      return response({ model: "m", choices: [{ message: { content }, finish_reason: "stop" }] });
+    };
+    await runAgent({ agent: "support", input: { ticketMessage: "¿Qué servicios ofrece la barbería?", knownContext: "VISITOR: ¿Qué servicios ofrece la barbería?" }, tools: barbershopTools });
+    assert.equal(toolPromptRequests.length, 2);
+    assert.equal(toolPromptRequests[0]?.max_tokens, 180);
+    assert.equal(toolPromptRequests[1]?.max_tokens, 550);
+    const firstInferenceMessages = toolPromptRequests[1]?.messages as Array<{ role: string; content: string }>;
+    assert.ok(firstInferenceMessages.some((message) => message.content.includes("TOOL DEFINITIONS (UNTRUSTED CONFIGURATION)")));
+    assert.ok(firstInferenceMessages.some((message) => message.content.includes("ORCHESTRATION OUTPUT CONTRACT")));
+  } finally {
+    globalThis.fetch = originalToolPromptFetch;
+  }
+
+  const argumentExtractionRequests: Record<string, unknown>[] = [];
+  const originalArgumentExtractionFetch = globalThis.fetch;
+  try {
+    globalThis.fetch = async (_input, init) => {
+      const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      argumentExtractionRequests.push(body);
+      const content = argumentExtractionRequests.length === 1
+        ? '{"decision":"USE_TOOL","tool":"service_list"}'
+        : "{}";
+      return response({ model: "m", choices: [{ message: { content }, finish_reason: "stop" }] });
+    };
+    await runAgent({ agent: "support", input: { ticketMessage: "¿Qué servicios ofrece la barbería?", knownContext: "VISITOR: ¿Qué servicios ofrece la barbería?" }, tools: barbershopTools });
+    assert.equal(argumentExtractionRequests.length, 2);
+    assert.equal(argumentExtractionRequests[0]?.max_tokens, 180);
+    assert.equal(argumentExtractionRequests[1]?.max_tokens, 180);
+  } finally {
+    globalThis.fetch = originalArgumentExtractionFetch;
+  }
+
+  const followUpRequests: Record<string, unknown>[] = [];
+  const originalFollowUpFetch = globalThis.fetch;
+  try {
+    globalThis.fetch = async (_input, init) => {
+      const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      followUpRequests.push(body);
+      return response({ model: "m", choices: [{ message: { content: JSON.stringify({ suggested_reply: validSupportOutput.suggested_reply }) }, finish_reason: "stop" }] });
+    };
+    await runAgent({ agent: "support", input: { ticketMessage: "¿Qué servicios ofrece la barbería?", knownContext: "VISITOR: ¿Qué servicios ofrece la barbería?" }, tools: barbershopTools, toolResult: barbershopToolResult });
+    assert.equal(followUpRequests.length, 1);
+    assert.equal(followUpRequests[0]?.max_tokens, 180);
+    assert.equal(followUpRequests[0]?.temperature, 0);
+    const followUpResponseFormat = followUpRequests[0]?.response_format as { json_schema?: { schema?: { properties?: Record<string, unknown>; required?: string[] } } } | undefined;
+    const followUpSchema = followUpResponseFormat?.json_schema?.schema;
+    assert.deepEqual(Object.keys(followUpSchema?.properties ?? {}), ["suggested_reply"]);
+    assert.deepEqual(followUpSchema?.required, ["suggested_reply"]);
+    assert.ok(JSON.stringify(followUpSchema).length < 200);
+    assert.doesNotThrow(() => supportToolResultFollowUpSchema.parse({ suggested_reply: validSupportOutput.suggested_reply }));
+    const publicSupportOutput = supportOutputSchema.parse(assembleSupportToolResultOutput({ suggested_reply: validSupportOutput.suggested_reply }));
+    assert.equal(publicSupportOutput.suggested_reply, validSupportOutput.suggested_reply);
+    assert.equal(publicSupportOutput.safe_reply, validSupportOutput.suggested_reply);
+    assert.equal(publicSupportOutput.category, "general");
+    assert.equal(publicSupportOutput.priority, "low");
+    assert.equal(publicSupportOutput.escalate_to_human, false);
+    assert.equal(publicSupportOutput.is_in_scope, true);
+    assert.equal(publicSupportOutput.out_of_scope_reason, null);
+    assert.equal(resolveToolResultFollowUpMaxTokens(550), 180);
+    assert.equal(resolveToolResultFollowUpMaxTokens(220), 180);
+    assert.equal(resolveToolResultFollowUpMaxTokens(180), 180);
+    assert.equal(resolveToolResultFollowUpMaxTokens(120), 120);
+    const followUpMessages = followUpRequests[0]?.messages as Array<{ role: string; content: string }>;
+    const followUpText = followUpMessages.map((message) => message.content).join("\n");
+    assert.doesNotMatch(followUpText, /TOOL DEFINITIONS \(UNTRUSTED CONFIGURATION\)/);
+    assert.doesNotMatch(followUpText, /Allowed tool names/);
+    assert.doesNotMatch(followUpText, /"action":"CALL_TOOL"/);
+    assert.match(followUpText, /TOOL RESULT \(UNTRUSTED DATA\)/);
+    assert.match(followUpText, /TOOL RESULT FOLLOW-UP/);
+    assert.match(followUpText, /no CALL_TOOL/);
+    const followUpSystemChars = followUpMessages[0]?.content.length ?? 0;
+    assert.ok(followUpSystemChars <= 900, `follow-up system chars exceeded target: ${followUpSystemChars}`);
+    const followUpChars = followUpMessages.reduce((total, message) => total + message.content.length, 0);
+    const followUpEstimatedTokens = estimateTextTokens("x".repeat(followUpChars), 3);
+    assert.ok(followUpEstimatedTokens <= 1200, `follow-up estimated tokens exceeded gateway limit: ${followUpEstimatedTokens}`);
+    assert.ok(followUpEstimatedTokens <= 1000, `follow-up estimated tokens did not leave enough margin: ${followUpEstimatedTokens}`);
+    const previousFollowUpMessages = [
+      ...followUpMessages.slice(0, 1).map((message) => ({
+        ...message,
+        content: buildToolAwareSystemPrompt(message.content, barbershopTools, barbershopToolResult, { type: "object", required: ["category", "priority", "summary", "suggested_reply", "escalate_to_human", "is_in_scope", "out_of_scope_reason", "safe_reply"] }, buildSelectionDirective(null, barbershopToolResult))
+      })),
+      ...followUpMessages.slice(1, 2),
+      ...buildToolContext(barbershopTools),
+      ...buildToolResultMessage(barbershopToolResult)
+    ];
+    const previousFollowUpChars = previousFollowUpMessages.reduce((total, message) => total + message.content.length, 0);
+    assert.ok(previousFollowUpChars > followUpChars);
+  } finally {
+    globalThis.fetch = originalFollowUpFetch;
+  }
   assert.throws(() => leadInputSchema.parse({ leadMessage: "x" }));
   assert.throws(() => supportInputSchema.parse({ ticketMessage: "x" }));
   assert.equal(leadOutputSchema.parse({ summary: "s", detected_service: "CRM", lead_temperature: "warm", missing_information: [], suggested_next_action: "a", reply_to_client: "r", is_in_scope: true, out_of_scope_reason: null, safe_reply: "s" }).detected_service, "CRM");

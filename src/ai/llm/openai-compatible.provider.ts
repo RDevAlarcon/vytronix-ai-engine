@@ -5,7 +5,7 @@ type OpenAiCompatiblePayload = {
   model?: string;
   choices?: Array<{ message?: { content?: string | null; tool_calls?: Array<{ id?: string; function?: { name?: string; arguments?: string } }> }; finish_reason?: string | null }>;
   usage?: { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number };
-  error?: { message?: string };
+  error?: { code?: string; message?: string };
 };
 
 export type OpenAiCompatibleProviderConfig = {
@@ -65,7 +65,12 @@ export class OpenAiCompatibleProvider implements LlmProvider {
         throw new AppError("LLM provider returned an error", {
           code: "LLM_UPSTREAM_ERROR",
           status: 502,
-          details: { provider: this.name, upstreamMessage: payload.error?.message }
+          details: {
+            provider: this.name,
+            upstreamStatus: response.status,
+            upstreamCode: payload.error?.code,
+            upstreamMessage: payload.error?.message?.slice(0, 500)
+          }
         });
       }
 

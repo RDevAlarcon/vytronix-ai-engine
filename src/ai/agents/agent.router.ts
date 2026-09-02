@@ -31,6 +31,7 @@ import {
   buildToolResultMessage,
   buildToolOrchestrationInstructions,
   buildToolAwareSystemPrompt,
+  buildToolResultFollowUpSystemPrompt,
   toolResultSchema,
   toolsSchema,
   validateToolCall,
@@ -55,6 +56,7 @@ const agentRegistry = {
 
 export const getAgentDefinition = (name: AgentName) => agentRegistry[name];
 const FAST_ENABLED_AGENTS = new Set<AgentName>(["lead"]);
+export const TOOL_RESULT_FOLLOW_UP_MAX_TOKENS = 180;
 
 const isPureGreeting = (value: unknown): boolean => {
   if (typeof value !== "string") return false;
@@ -76,6 +78,28 @@ const resolveMaxTokens = (
 
   return options.maxTokens;
 };
+
+export const resolveToolResultFollowUpMaxTokens = (configuredMaxTokens: number | undefined): number =>
+  configuredMaxTokens === undefined
+    ? TOOL_RESULT_FOLLOW_UP_MAX_TOKENS
+    : Math.min(configuredMaxTokens, TOOL_RESULT_FOLLOW_UP_MAX_TOKENS);
+
+export const supportToolResultFollowUpSchema = z.object({
+  suggested_reply: z.string().min(1)
+}).strict();
+
+type SupportToolResultFollowUpOutput = z.infer<typeof supportToolResultFollowUpSchema>;
+
+export const assembleSupportToolResultOutput = (output: SupportToolResultFollowUpOutput) => supportAgent.outputSchema.parse({
+  category: "general",
+  priority: "low",
+  summary: "Respuesta final basada en resultado de herramienta.",
+  suggested_reply: output.suggested_reply,
+  escalate_to_human: false,
+  is_in_scope: true,
+  out_of_scope_reason: null,
+  safe_reply: output.suggested_reply
+});
 
 const resolveTemperature = (
   mode: AgentExecutionMode,
@@ -254,18 +278,25 @@ export const runAgent = async (request: AgentRunRequest): Promise<AgentRunResult
     diagnostics: toolSelection?.diagnostics
   };
   const usesToolContract = availableTools.length > 0 || Boolean(parsedRequest.toolResult);
+  const supportToolResultFollowUp = parsedRequest.agent === "support" && Boolean(parsedRequest.toolResult);
+  const toolResultFollowUpPromptSchema = supportToolResultFollowUp ? z.toJSONSchema(supportToolResultFollowUpSchema) : z.toJSONSchema(agentDefinition.outputSchema);
   const messagesWithKnowledge = [
     ...(usesToolContract
       ? baseMessages.map((message) => message.role === "system"
-        ? { ...message, content: buildToolAwareSystemPrompt(message.content, availableTools, parsedRequest.toolResult, z.toJSONSchema(agentDefinition.outputSchema), selectionDirective) }
+        ? {
+            ...message,
+            content: parsedRequest.toolResult
+              ? buildToolResultFollowUpSystemPrompt(message.content, parsedRequest.toolResult, toolResultFollowUpPromptSchema)
+              : buildToolAwareSystemPrompt(message.content, availableTools, undefined, z.toJSONSchema(agentDefinition.outputSchema), selectionDirective)
+          }
         : message)
       : baseMessages),
     ...buildRetrievedKnowledgeMessage(parsedRequest.ragContext),
-    ...buildToolContext(availableTools),
+    ...(!parsedRequest.toolResult ? buildToolContext(availableTools) : []),
     ...(parsedRequest.toolResult ? buildToolResultMessage(parsedRequest.toolResult) : [])
   ];
   const outputSchema = domainOnlyResponse
-    ? agentDefinition.outputSchema
+    ? supportToolResultFollowUp ? supportToolResultFollowUpSchema : agentDefinition.outputSchema
     : usesToolContract
     ? (nativeToolCalling
       ? buildToolAwareSchema(agentDefinition.outputSchema)
@@ -275,7 +306,9 @@ export const runAgent = async (request: AgentRunRequest): Promise<AgentRunResult
     : agentDefinition.outputSchema;
   let validatedToolCall: ReturnType<typeof validateToolCall> | undefined;
   const maxTokens = resolveMaxTokens(effectiveMode, agentDefinition.llmOptions);
+  const effectiveMaxTokens = parsedRequest.toolResult ? resolveToolResultFollowUpMaxTokens(maxTokens) : maxTokens;
   const temperature = resolveTemperature(effectiveMode, agentDefinition.llmOptions);
+  const effectiveTemperature = supportToolResultFollowUp ? 0 : temperature;
   const agentStartedAt = Date.now();
   const execution = await executeStructuredOutput({
     baseMessages: messagesWithKnowledge,
@@ -284,8 +317,8 @@ export const runAgent = async (request: AgentRunRequest): Promise<AgentRunResult
     generate: async (messages) => {
       const response = await llmService.chat({
         messages,
-        temperature,
-        maxTokens,
+        temperature: effectiveTemperature,
+        maxTokens: effectiveMaxTokens,
         nativeTools: nativeToolCalling ? availableTools.map((tool) => ({ name: tool.name, description: tool.description, parameters: tool.inputSchema })) : undefined,
         responseSchema: llmService.supportsStructuredOutput && !nativeToolCalling && usesToolContract
         ? (enforcedToolSelection?.decision.decision === "USE_TOOL" && enforcedToolSelection.selectedTool
@@ -335,7 +368,11 @@ export const runAgent = async (request: AgentRunRequest): Promise<AgentRunResult
       expectedBehavior: "RESPOND"
     } : undefined,
     repairInstructions: usesToolContract
-      ? buildToolOrchestrationInstructions(availableTools, parsedRequest.toolResult, z.toJSONSchema(agentDefinition.outputSchema), selectionDirective)
+      ? parsedRequest.toolResult
+        ? supportToolResultFollowUp
+          ? "A ToolResult is already available. Return only JSON with suggested_reply. Do not return CALL_TOOL, action, toolCall, markdown, or explanations."
+          : "A ToolResult is already available. Return only the final domain JSON object matching the agent output schema. Do not return CALL_TOOL, action, toolCall, markdown, or explanations."
+        : buildToolOrchestrationInstructions(availableTools, undefined, z.toJSONSchema(agentDefinition.outputSchema), selectionDirective)
       : undefined,
     inspectParsed: (parsed) => {
       const value = parsed && typeof parsed === "object" ? parsed as Record<string, unknown> : {};
@@ -371,7 +408,10 @@ export const runAgent = async (request: AgentRunRequest): Promise<AgentRunResult
     }
   });
   const output = execution.parsedOutput as ToolAwareOutput<unknown>;
-  const assembledResponse = domainOnlyResponse ? assembleRespond(execution.parsedOutput) : output;
+  const parsedOutput = supportToolResultFollowUp
+    ? assembleSupportToolResultOutput(execution.parsedOutput as SupportToolResultFollowUpOutput)
+    : execution.parsedOutput;
+  const assembledResponse = domainOnlyResponse ? assembleRespond(parsedOutput) : output;
   const orchestration = assembledResponse.action === "CALL_TOOL" && validatedToolCall
     ? { action: "CALL_TOOL" as const, toolCall: validatedToolCall }
     : undefined;
@@ -382,7 +422,7 @@ export const runAgent = async (request: AgentRunRequest): Promise<AgentRunResult
   return {
         agent: parsedRequest.agent,
         mode: effectiveMode,
-        parsedOutput: domainOnlyResponse ? execution.parsedOutput : usesToolContract ? (output.action === "CALL_TOOL" ? null : output.result) : execution.parsedOutput,
+        parsedOutput: domainOnlyResponse ? parsedOutput : usesToolContract ? (output.action === "CALL_TOOL" ? null : output.result) : execution.parsedOutput,
         rawOutput: execution.rawOutput,
         model: execution.response.model,
         provider: execution.response.provider,
