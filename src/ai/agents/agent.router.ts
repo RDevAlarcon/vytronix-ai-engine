@@ -60,7 +60,8 @@ const agentRegistry = {
 
 export const getAgentDefinition = (name: AgentName) => agentRegistry[name];
 const FAST_ENABLED_AGENTS = new Set<AgentName>(["lead"]);
-export const TOOL_RESULT_FOLLOW_UP_MAX_TOKENS = 180;
+export const TOOL_RESULT_FOLLOW_UP_MAX_TOKENS = 120;
+export const TOOL_RESULT_FOLLOW_UP_MAX_REPLY_CHARS = 200;
 
 const isPureGreeting = (value: unknown): boolean => {
   if (typeof value !== "string") return false;
@@ -89,10 +90,111 @@ export const resolveToolResultFollowUpMaxTokens = (configuredMaxTokens: number |
     : Math.min(configuredMaxTokens, TOOL_RESULT_FOLLOW_UP_MAX_TOKENS);
 
 export const supportToolResultFollowUpSchema = z.object({
-  suggested_reply: z.string().min(1)
+  suggested_reply: z.string().min(1).max(TOOL_RESULT_FOLLOW_UP_MAX_REPLY_CHARS)
 }).strict();
 
 type SupportToolResultFollowUpOutput = z.infer<typeof supportToolResultFollowUpSchema>;
+
+export type SupportToolResultFollowUpShape = {
+  responseCharCount: number;
+  trimmedCharCount: number;
+  isEmpty: boolean;
+  startsWithOpenBrace: boolean;
+  endsWithCloseBrace: boolean;
+  containsOpenBrace: boolean;
+  containsCloseBrace: boolean;
+  firstOpenBraceIndex: number;
+  lastCloseBraceIndex: number;
+  containsCodeFence: boolean;
+  containsNewline: boolean;
+  containsControlChars: boolean;
+  plainTextFallbackEligible: boolean;
+  plainTextFallbackRejectedReason: "NONE" | "EMPTY" | "TOO_LONG" | "CONTAINS_BRACE" | "CONTAINS_CODE_FENCE" | "CONTAINS_UNSAFE_CONTROL" | "JSON_CANDIDATE_FOUND";
+  jsonExtractionResult: "STRICT_JSON_CANDIDATE" | "EMBEDDED_JSON_CANDIDATE" | "PARTIAL_JSON_CANDIDATE" | "NO_JSON_CANDIDATE";
+  jsonParseResult: "PASS" | "FAIL" | "NOT_ATTEMPTED";
+  schemaValidationResult: "PASS" | "FAIL" | "NOT_ATTEMPTED";
+  finalFailureCode: "LLM_JSON_NOT_FOUND" | "LLM_INVALID_JSON" | "AGENT_OUTPUT_INVALID" | null;
+};
+
+export const inspectSupportToolResultFollowUpShape = (content: string): SupportToolResultFollowUpShape => {
+  const text = content.trim();
+  const firstOpenBraceIndex = text.indexOf("{");
+  const lastCloseBraceIndex = text.lastIndexOf("}");
+  const containsOpenBrace = firstOpenBraceIndex >= 0;
+  const containsCloseBrace = lastCloseBraceIndex >= 0;
+  const completeCandidate = containsOpenBrace && containsCloseBrace && lastCloseBraceIndex > firstOpenBraceIndex;
+  const strictCandidate = text.startsWith("{") && text.endsWith("}");
+  const containsCodeFence = /```/.test(text);
+  const containsControlChars = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/.test(text);
+  const jsonExtractionResult = strictCandidate
+    ? "STRICT_JSON_CANDIDATE" as const
+    : completeCandidate
+      ? "EMBEDDED_JSON_CANDIDATE" as const
+      : containsOpenBrace || containsCloseBrace
+        ? "PARTIAL_JSON_CANDIDATE" as const
+        : "NO_JSON_CANDIDATE" as const;
+  let jsonParseResult: SupportToolResultFollowUpShape["jsonParseResult"] = "NOT_ATTEMPTED";
+  let schemaValidationResult: SupportToolResultFollowUpShape["schemaValidationResult"] = "NOT_ATTEMPTED";
+  if (completeCandidate) {
+    try {
+      const parsed = JSON.parse(text.slice(firstOpenBraceIndex, lastCloseBraceIndex + 1)) as unknown;
+      jsonParseResult = "PASS";
+      schemaValidationResult = supportToolResultFollowUpSchema.safeParse(parsed).success ? "PASS" : "FAIL";
+    } catch {
+      jsonParseResult = "FAIL";
+    }
+  }
+  const plainTextFallbackRejectedReason: SupportToolResultFollowUpShape["plainTextFallbackRejectedReason"] = !text
+    ? "EMPTY"
+    : text.length > TOOL_RESULT_FOLLOW_UP_MAX_REPLY_CHARS
+      ? "TOO_LONG"
+      : completeCandidate
+        ? "JSON_CANDIDATE_FOUND"
+        : containsOpenBrace || containsCloseBrace
+          ? "CONTAINS_BRACE"
+          : containsCodeFence
+            ? "CONTAINS_CODE_FENCE"
+            : containsControlChars
+              ? "CONTAINS_UNSAFE_CONTROL"
+              : "NONE";
+  const finalFailureCode = plainTextFallbackRejectedReason === "NONE" || schemaValidationResult === "PASS"
+    ? null
+    : !completeCandidate
+      ? "LLM_JSON_NOT_FOUND" as const
+      : jsonParseResult === "FAIL"
+        ? "LLM_INVALID_JSON" as const
+        : "AGENT_OUTPUT_INVALID" as const;
+  return {
+    responseCharCount: content.length,
+    trimmedCharCount: text.length,
+    isEmpty: !text,
+    startsWithOpenBrace: text.startsWith("{"),
+    endsWithCloseBrace: text.endsWith("}"),
+    containsOpenBrace,
+    containsCloseBrace,
+    firstOpenBraceIndex,
+    lastCloseBraceIndex,
+    containsCodeFence,
+    containsNewline: /[\r\n]/.test(text),
+    containsControlChars,
+    plainTextFallbackEligible: plainTextFallbackRejectedReason === "NONE",
+    plainTextFallbackRejectedReason,
+    jsonExtractionResult,
+    jsonParseResult,
+    schemaValidationResult,
+    finalFailureCode
+  };
+};
+
+export const normalizeSupportToolResultFollowUpContent = (content: string): string => {
+  const shape = inspectSupportToolResultFollowUpShape(content);
+  if (!shape.plainTextFallbackEligible) return content;
+  const text = content.trim();
+  // JSON (including fenced/embedded JSON) stays on the normal strict parser path.
+  // Braces or code fences without recoverable JSON are treated as malformed and
+  // remain on the strict parser path, which fails closed for this one-attempt stage.
+  return JSON.stringify({ suggested_reply: text });
+};
 
 export const assembleSupportToolResultOutput = (output: SupportToolResultFollowUpOutput) => supportAgent.outputSchema.parse({
   category: "general",
@@ -494,9 +596,21 @@ export const runAgent = async (request: AgentRunRequest): Promise<AgentRunResult
         }
         return { ...response, content: JSON.stringify({ action: "CALL_TOOL", toolCall: { name: call.name, arguments: grounded.arguments, requiresConfirmation: tool.requiresConfirmation } }) };
       }
+      if (supportToolResultFollowUp) {
+        const shape = inspectSupportToolResultFollowUpShape(response.content);
+        console.error(JSON.stringify({
+          event: "tool_result_followup_output_shape",
+          stage: "tool_result_followup",
+          correlationId: parsedRequest.diagnosticCorrelationId,
+          toolName: parsedRequest.toolResult?.toolName,
+          ...shape
+        }));
+        return { ...response, content: normalizeSupportToolResultFollowUpContent(response.content) };
+      }
       return response;
     },
     captureRawOutput: process.env.BENCHMARK_CAPTURE_RAW_OUTPUT === "true" || process.env.TOOL_DIAGNOSTICS_CAPTURE_RAW_OUTPUT === "true",
+    maxAttempts: supportToolResultFollowUp ? 1 : 2,
     diagnosticContext: parsedRequest.toolResult ? {
       toolResultPresent: true,
       toolResultStatus: parsedRequest.toolResult.status,

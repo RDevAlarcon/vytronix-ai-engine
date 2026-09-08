@@ -108,12 +108,14 @@ export const executeStructuredOutput = async <T>(params: {
   repairInstructions?: string;
   captureRawOutput?: boolean;
   maxDiagnosticOutputLength?: number;
+  maxAttempts?: 1 | 2;
 }): Promise<StructuredOutputExecution<T>> => {
   let previousOutput = "";
   let issues: StructuredOutputIssue[] = [];
   const diagnostics: StructuredOutputDiagnostic[] = [];
 
-  for (let attempt = 1; attempt <= 2; attempt += 1) {
+  const maxAttempts = params.maxAttempts ?? 2;
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
     const messages = attempt === 1
       ? params.baseMessages
       : [...params.baseMessages, {
@@ -168,7 +170,7 @@ export const executeStructuredOutput = async <T>(params: {
       } else if (error instanceof AppError && ["TOOL_NOT_AVAILABLE", "TOOL_ARGUMENTS_INVALID", "TOOL_CALL_INVALID", "TOOL_SELECTION_INVALID"].includes(error.code)) {
         issues = [{ path: "action", code: error.code, message: error.message }];
       }
-      if (attempt === 2 || !(error instanceof AppError) || !["LLM_INVALID_JSON", "LLM_JSON_NOT_FOUND", "AGENT_OUTPUT_INVALID", "TOOL_NOT_AVAILABLE", "TOOL_ARGUMENTS_INVALID", "TOOL_CALL_INVALID", "TOOL_SELECTION_INVALID"].includes(error.code)) {
+      if (attempt === maxAttempts || !(error instanceof AppError) || !["LLM_INVALID_JSON", "LLM_JSON_NOT_FOUND", "AGENT_OUTPUT_INVALID", "TOOL_NOT_AVAILABLE", "TOOL_ARGUMENTS_INVALID", "TOOL_CALL_INVALID", "TOOL_SELECTION_INVALID"].includes(error.code)) {
         if (error instanceof AppError) throw new AppError(error.message, { code: error.code, status: error.status, details: { ...(error.details as object ?? {}), diagnostics } });
         throw error;
       }
