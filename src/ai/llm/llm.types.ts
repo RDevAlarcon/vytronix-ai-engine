@@ -16,11 +16,18 @@ export type LlmChatRequest = {
   messages: LlmMessage[];
   model?: string;
   temperature?: number;
+  seed?: number;
   maxTokens?: number;
   timeoutMs?: number;
   responseSchema?: unknown;
   nativeTools?: LlmNativeTool[];
   keepAlive?: string | number;
+  diagnostic?: {
+    stage: string;
+    correlationId?: string;
+    agent?: string;
+    toolName?: string;
+  };
 };
 
 export type LlmUsage = {

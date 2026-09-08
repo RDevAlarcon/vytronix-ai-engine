@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { z } from "zod";
+import { randomUUID } from "node:crypto";
 import { runAgent } from "@/ai/agents/agent.router";
 import { createAgentRun } from "@/db/repositories/agent-runs.repository";
 import { AppError, toErrorMessage, toPublicError } from "@/lib/errors";
@@ -7,6 +8,7 @@ import { enforceApiGuard } from "@/lib/api-guard";
 import { assertRequestBodySize } from "@/lib/request-limits";
 import { ragContextSchema } from "@/ai/rag/rag-context";
 import { toolResultSchema, toolsSchema } from "@/ai/tools/tool-contract";
+import { temporalContextSchema } from "@/ai/tools/tool-temporal-context";
 
 export const runtime = "nodejs";
 
@@ -16,11 +18,13 @@ export const runSchema = z.object({
   mode: z.enum(["standard", "fast"]).default("standard"),
   ragContext: ragContextSchema.optional(),
   tools: toolsSchema.optional(),
-  toolResult: toolResultSchema.optional()
+  toolResult: toolResultSchema.optional(),
+  temporalContext: temporalContextSchema.optional()
 });
 
 export async function POST(request: NextRequest) {
   let payload: z.infer<typeof runSchema> | null = null;
+  const correlationId = randomUUID();
 
   try {
     enforceApiGuard(request);
@@ -28,7 +32,7 @@ export async function POST(request: NextRequest) {
     assertRequestBodySize(raw, request.headers.get("content-length"));
     payload = runSchema.parse(raw);
 
-    const result = await runAgent(payload);
+    const result = await runAgent({ ...payload, diagnosticCorrelationId: correlationId });
     const runId = await createAgentRun({
       agent: payload.agent,
       input: payload.input,
@@ -82,7 +86,7 @@ export async function POST(request: NextRequest) {
     }
 
     const publicError = toPublicError(error);
-    console.error(JSON.stringify({ event: "agent_run_failed", agent: fallbackAgent, code: publicError.code, timestamp: new Date().toISOString() }));
+    console.error(JSON.stringify({ event: "agent_run_failed", agent: fallbackAgent, code: publicError.code, correlationId, timestamp: new Date().toISOString() }));
     return NextResponse.json({ success: false, error: publicError }, { status: error instanceof AppError ? error.status : 500 });
   }
 }

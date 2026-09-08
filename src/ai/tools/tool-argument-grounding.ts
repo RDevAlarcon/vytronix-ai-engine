@@ -1,4 +1,6 @@
 import type { ToolDefinition } from "@/ai/tools/tool-contract";
+import { buildExtractionSchema } from "@/ai/tools/tool-argument-extractor";
+import { dateFromEvidence, resolveCurrentDate, type TemporalContext } from "@/ai/tools/tool-temporal-context";
 
 export type ToolArgumentGroundingResult = {
   status: "READY" | "MISSING_INFORMATION" | "UNGROUNDED" | "INVALID";
@@ -18,25 +20,26 @@ export const normalizeRelativeDate = (value: unknown): unknown => {
   return value;
 };
 
-const hasDateEvidence = (text: string): boolean => /\b(hoy|mañana|manana|pasado mañana|pasado manana|today|tomorrow|\d{1,2}[/-]\d{1,2}|\d{1,2}\s+de\s+[a-záéíóú]+)\b/i.test(text);
 const hasTimeEvidence = (text: string): boolean => /\b(?:[01]?\d|2[0-3]):[0-5]\d\b|\b(?:a\s+las|a\s+la)\s+\d{1,2}\b/i.test(text);
 
-export const groundToolArguments = (input: unknown, tool: ToolDefinition, argumentsValue: Record<string, unknown>): ToolArgumentGroundingResult => {
+export const groundToolArguments = (input: unknown, tool: ToolDefinition, argumentsValue: Record<string, unknown>, temporalContext?: TemporalContext): ToolArgumentGroundingResult => {
   const text = inputText(input);
   const grounded = { ...argumentsValue };
   const missing: string[] = [];
   const ungrounded: string[] = [];
-  const required = tool.inputSchema.required ?? [];
-  for (const field of required) {
+  const schema = buildExtractionSchema(tool.inputSchema);
+  const required = schema.required ?? [];
+  const currentDate = resolveCurrentDate(temporalContext);
+  for (const field of new Set([...required, ...Object.keys(grounded)])) {
+    if (!Object.hasOwn(schema.properties ?? {}, field)) { ungrounded.push(field); continue; }
     if (!(field in grounded) || grounded[field] === undefined || grounded[field] === null || grounded[field] === "") {
       missing.push(field);
       continue;
     }
     if (field === "date") {
-      if (!hasDateEvidence(text)) { missing.push(field); ungrounded.push(field); continue; }
-      if (/\b(ma[ñn]ana|tomorrow)\b/i.test(text)) grounded[field] = "tomorrow";
-      else if (/\bhoy|today\b/i.test(text)) grounded[field] = "today";
-      else if (/pasado\s+ma[ñn]ana|day_after_tomorrow/i.test(text)) grounded[field] = "day_after_tomorrow";
+      const date = dateFromEvidence(text, currentDate);
+      if (!date) { missing.push(field); ungrounded.push(field); continue; }
+      grounded[field] = date;
     } else if (field === "time") {
       if (!hasTimeEvidence(text)) { missing.push(field); ungrounded.push(field); continue; }
     } else if (typeof grounded[field] === "string" && !text.includes(String(grounded[field]).toLocaleLowerCase("es"))) {

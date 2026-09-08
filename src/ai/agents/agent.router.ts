@@ -20,6 +20,7 @@ import { buildSelectionDirective, selectTool } from "@/ai/tools/tool-selector";
 import { resolveToolRoutingStrategy } from "@/ai/tools/tool-routing";
 import { extractToolArguments } from "@/ai/tools/tool-argument-extractor";
 import { groundToolArguments } from "@/ai/tools/tool-argument-grounding";
+import { resolveCurrentDate, temporalContextSchema } from "@/ai/tools/tool-temporal-context";
 import {
   buildToolAwareSchema,
   buildRespondOnlySchema,
@@ -45,7 +46,9 @@ const runRequestSchema = z.object({
   mode: z.enum(["standard", "fast"]).default("standard"),
   ragContext: ragContextSchema.optional(),
   tools: toolsSchema.optional(),
-  toolResult: toolResultSchema.optional()
+  toolResult: toolResultSchema.optional(),
+  temporalContext: temporalContextSchema.optional(),
+  diagnosticCorrelationId: z.string().uuid().optional()
 });
 
 const agentRegistry = {
@@ -245,6 +248,7 @@ const buildOutOfScopeOutput = (agent: AgentName, reason: string): unknown => {
 
 export const runAgent = async (request: AgentRunRequest): Promise<AgentRunResult> => {
   const parsedRequest = runRequestSchema.parse(request);
+  const temporalContext = { currentDate: resolveCurrentDate(parsedRequest.temporalContext) };
   const agentDefinition = getAgentDefinition(parsedRequest.agent) as AgentDefinition<unknown, unknown>;
   const effectiveMode: AgentExecutionMode =
     parsedRequest.mode === "fast" && FAST_ENABLED_AGENTS.has(parsedRequest.agent) ? "fast" : "standard";
@@ -294,12 +298,12 @@ export const runAgent = async (request: AgentRunRequest): Promise<AgentRunResult
   const routingStrategy = resolveToolRoutingStrategy({ tools: availableTools, ragContext: parsedRequest.ragContext, toolResult: parsedRequest.toolResult, supportsNativeToolCalling: llmService.supportsNativeToolCalling });
   const separatedToolDecision = availableTools.length > 0 && !parsedRequest.toolResult;
   const nativeToolCalling = routingStrategy === "NATIVE" && !separatedToolDecision;
-  const toolSelection = (routingStrategy === "SELECTOR" || separatedToolDecision) ? await selectTool({ agent: parsedRequest.agent, input: parsedInput.data, tools: availableTools, toolResult: parsedRequest.toolResult }) : null;
+  const toolSelection = (routingStrategy === "SELECTOR" || separatedToolDecision) ? await selectTool({ agent: parsedRequest.agent, input: parsedInput.data, tools: availableTools, toolResult: parsedRequest.toolResult, correlationId: parsedRequest.diagnosticCorrelationId }) : null;
   const argumentExtraction = toolSelection?.decision.decision === "USE_TOOL" && toolSelection.selectedTool
-    ? await extractToolArguments({ input: parsedInput.data, tool: toolSelection.selectedTool })
+    ? await extractToolArguments({ input: parsedInput.data, tool: toolSelection.selectedTool, correlationId: parsedRequest.diagnosticCorrelationId, currentDate: temporalContext.currentDate })
     : undefined;
   const groundedArguments = argumentExtraction?.status === "SUCCESS" && toolSelection?.selectedTool
-    ? groundToolArguments(parsedInput.data, toolSelection.selectedTool, argumentExtraction.arguments ?? {})
+    ? groundToolArguments(parsedInput.data, toolSelection.selectedTool, argumentExtraction.arguments ?? {}, temporalContext)
     : undefined;
   if (groundedArguments?.status === "READY" && toolSelection?.selectedTool && argumentExtraction) {
     const totalDurationMs = Date.now() - startedAt;
@@ -361,6 +365,11 @@ export const runAgent = async (request: AgentRunRequest): Promise<AgentRunResult
       };
     }
   }
+  // Failed extraction/grounding must not fall through to a legacy generation
+  // using the original schema, which can still contain canonical ID properties.
+  if (argumentExtraction && groundedArguments?.status !== "READY") {
+    throw new AppError("Tool arguments could not be grounded", { code: "TOOL_ARGUMENTS_INVALID", status: 422 });
+  }
   const enforcedToolSelection = groundedArguments && groundedArguments.status !== "READY" ? null : toolSelection;
   const domainOnlyResponse = !nativeToolCalling && (
     Boolean(parsedRequest.toolResult) ||
@@ -384,9 +393,20 @@ export const runAgent = async (request: AgentRunRequest): Promise<AgentRunResult
   };
   const usesToolContract = availableTools.length > 0 || Boolean(parsedRequest.toolResult);
   const supportToolResultFollowUp = parsedRequest.agent === "support" && Boolean(parsedRequest.toolResult);
+  const noToolNormalResponse = !nativeToolCalling && !parsedRequest.toolResult && enforcedToolSelection?.decision.decision === "NO_TOOL";
   const toolResultFollowUpPromptSchema = supportToolResultFollowUp ? z.toJSONSchema(supportToolResultFollowUpSchema) : z.toJSONSchema(agentDefinition.outputSchema);
   const messagesWithKnowledge = [
-    ...(usesToolContract
+    ...(noToolNormalResponse
+      ? baseMessages.map((message) => message.role === "system"
+        ? {
+            ...message,
+            content: [
+              message.content,
+              "Tool selection already determined no tool is required. Produce the normal domain output only; do not call or mention tools."
+            ].join("\n\n")
+          }
+        : message)
+      : usesToolContract
       ? baseMessages.map((message) => message.role === "system"
         ? {
             ...message,
@@ -397,7 +417,7 @@ export const runAgent = async (request: AgentRunRequest): Promise<AgentRunResult
         : message)
       : baseMessages),
     ...buildRetrievedKnowledgeMessage(parsedRequest.ragContext),
-    ...(!parsedRequest.toolResult ? buildToolContext(availableTools) : []),
+    ...(!parsedRequest.toolResult && !noToolNormalResponse ? buildToolContext(availableTools) : []),
     ...(parsedRequest.toolResult ? buildToolResultMessage(parsedRequest.toolResult) : [])
   ];
   const outputSchema = domainOnlyResponse
@@ -429,7 +449,15 @@ export const runAgent = async (request: AgentRunRequest): Promise<AgentRunResult
         ? (enforcedToolSelection?.decision.decision === "USE_TOOL" && enforcedToolSelection.selectedTool
           ? buildCallToolResponseSchema(enforcedToolSelection.selectedTool)
           : z.toJSONSchema(outputSchema))
-        : undefined
+        : undefined,
+        diagnostic: {
+          stage: supportToolResultFollowUp
+            ? (messages.length > messagesWithKnowledge.length ? "tool_result_followup_repair" : "tool_result_followup")
+            : (messages.length > messagesWithKnowledge.length ? "normal_response_repair" : "normal_response"),
+          correlationId: parsedRequest.diagnosticCorrelationId,
+          agent: parsedRequest.agent,
+          toolName: enforcedToolSelection?.selectedTool?.name ?? parsedRequest.toolResult?.toolName
+        }
       });
       if (nativeToolCalling && !response.toolCalls?.length && !response.content.trim()) {
         const fallbackResponse = await llmService.chat({
@@ -442,7 +470,8 @@ export const runAgent = async (request: AgentRunRequest): Promise<AgentRunResult
           ],
           temperature,
           maxTokens,
-          responseSchema: z.toJSONSchema(agentDefinition.outputSchema)
+          responseSchema: z.toJSONSchema(agentDefinition.outputSchema),
+          diagnostic: { stage: "native_no_tool_fallback", correlationId: parsedRequest.diagnosticCorrelationId, agent: parsedRequest.agent }
         });
         const fallbackJson = JSON.parse(fallbackResponse.content);
         return { ...fallbackResponse, content: JSON.stringify({ action: "RESPOND", result: fallbackJson }) };
@@ -453,13 +482,14 @@ export const runAgent = async (request: AgentRunRequest): Promise<AgentRunResult
         if (!call) throw new AppError("Native tool call is missing", { code: "TOOL_CALL_INVALID", status: 422 });
         const tool = availableTools.find((candidate) => candidate.name === call.name);
         if (!tool) throw new AppError("Native tool is not available", { code: "TOOL_NOT_AVAILABLE", status: 422 });
-        const grounded = groundToolArguments(parsedInput.data, tool, call.arguments);
+        const grounded = groundToolArguments(parsedInput.data, tool, call.arguments, temporalContext);
         if (grounded.status !== "READY") {
           return llmService.chat({
             messages: [...messages, { role: "system", content: `The selected tool cannot be requested yet. Ask the user only for these missing fields: ${grounded.missing.join(", ")}. Do not claim execution.` }],
             temperature,
             maxTokens,
-            responseSchema: z.toJSONSchema(buildRespondOnlySchema(agentDefinition.outputSchema))
+            responseSchema: z.toJSONSchema(buildRespondOnlySchema(agentDefinition.outputSchema)),
+            diagnostic: { stage: "native_missing_arguments_response", correlationId: parsedRequest.diagnosticCorrelationId, agent: parsedRequest.agent, toolName: tool.name }
           });
         }
         return { ...response, content: JSON.stringify({ action: "CALL_TOOL", toolCall: { name: call.name, arguments: grounded.arguments, requiresConfirmation: tool.requiresConfirmation } }) };

@@ -3,6 +3,7 @@ import type { ChatMessage } from "@/ai/llm/llm.types";
 import type { StructuredOutputDiagnostic } from "@/ai/structured-output/structured-output";
 import type { RagContext } from "@/ai/rag/rag-context";
 import type { ToolDefinition, ToolResult } from "@/ai/tools/tool-contract";
+import type { TemporalContext } from "@/ai/tools/tool-temporal-context";
 
 export type AgentName = "lead" | "landing" | "proposal" | "support";
 export type AgentExecutionMode = "standard" | "fast";
@@ -27,6 +28,8 @@ export type AgentRunRequest = {
   ragContext?: RagContext;
   tools?: ToolDefinition[];
   toolResult?: ToolResult;
+  diagnosticCorrelationId?: string;
+  temporalContext?: TemporalContext;
 };
 
 export type AgentRunResult<TOutput = unknown> = {

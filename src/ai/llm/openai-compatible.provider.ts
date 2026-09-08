@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { AppError } from "@/lib/errors";
 import type { LlmChatRequest, LlmChatResponse, LlmProvider, LlmProviderHealth, LlmProviderName } from "@/ai/llm/llm.types";
 
@@ -7,6 +8,33 @@ type OpenAiCompatiblePayload = {
   usage?: { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number };
   error?: { code?: string; message?: string };
 };
+
+const estimateTokens = (chars: number): number => chars === 0 ? 0 : Math.ceil(chars / 3);
+
+const sanitizeProviderMessage = (message: string | undefined): string | undefined => {
+  if (!message) return undefined;
+  return message.replace(/\s+/g, " ").trim().slice(0, 300);
+};
+
+const logSafeDiagnostic = (payload: Record<string, unknown>): void => {
+  console.error(JSON.stringify(payload));
+};
+
+const canonicalize = (value: unknown): unknown => {
+  if (Array.isArray(value)) return value.map(canonicalize);
+  if (!value || typeof value !== "object") return value;
+  return Object.fromEntries(
+    Object.entries(value as Record<string, unknown>)
+      .filter(([, child]) => child !== undefined)
+      .sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0)
+      .map(([key, child]) => [key, canonicalize(child)])
+  );
+};
+
+export const buildSafeRequestHash = (value: unknown): string => createHash("sha256")
+  .update(JSON.stringify(canonicalize(value)))
+  .digest("hex")
+  .slice(0, 16);
 
 export type OpenAiCompatibleProviderConfig = {
   name: LlmProviderName;
@@ -38,30 +66,73 @@ export class OpenAiCompatibleProvider implements LlmProvider {
   async chat(request: LlmChatRequest): Promise<LlmChatResponse> {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), request.timeoutMs ?? this.config.timeoutMs);
+    const requestPayload = {
+      model: request.model ?? this.config.defaultModel,
+      temperature: request.temperature ?? this.config.defaultTemperature,
+      ...(request.seed !== undefined ? { seed: request.seed } : {}),
+      max_tokens: request.maxTokens ?? this.config.defaultMaxTokens,
+      messages: request.messages,
+      ...((request.keepAlive ?? this.config.keepAlive) !== undefined && this.name === "ollama" ? { keep_alive: request.keepAlive ?? this.config.keepAlive } : {}),
+      ...(request.nativeTools && this.supportsNativeToolCalling ? { tools: request.nativeTools.map((tool) => ({ type: "function", function: tool })) , tool_choice: "auto" } : {}),
+      ...(request.responseSchema && this.supportsStructuredOutput ? {
+        response_format: {
+          type: "json_schema",
+          json_schema: { name: "vytronix_output", strict: true, schema: request.responseSchema }
+        }
+      } : {})
+    };
+    const messageChars = request.messages.map((message) => message.content.length);
+    const totalMessageChars = messageChars.reduce((total, chars) => total + chars, 0);
+    const responseFormatChars = "response_format" in requestPayload ? JSON.stringify(requestPayload.response_format).length : 0;
+    const nativeToolsChars = "tools" in requestPayload ? JSON.stringify(requestPayload.tools).length : 0;
+    const serializedRequestChars = JSON.stringify(requestPayload).length;
+    const requestHash = buildSafeRequestHash(requestPayload);
+
+    if (request.diagnostic) {
+      logSafeDiagnostic({
+        event: "llm_provider_request",
+        provider: this.name,
+        stage: request.diagnostic.stage,
+        correlationId: request.diagnostic.correlationId,
+        agent: request.diagnostic.agent,
+        toolName: request.diagnostic.toolName,
+        messageCount: request.messages.length,
+        totalMessageChars,
+        largestMessageChars: messageChars.length ? Math.max(...messageChars) : 0,
+        estimatedInputTokens: estimateTokens(totalMessageChars),
+        maxTokens: requestPayload.max_tokens,
+        estimatedContextTokens: estimateTokens(totalMessageChars) + Number(requestPayload.max_tokens),
+        responseSchemaChars: request.responseSchema ? JSON.stringify(request.responseSchema).length : 0,
+        responseFormatChars,
+        nativeToolsChars,
+        serializedRequestChars,
+        requestHash
+      });
+    }
 
     try {
       const response = await fetch(`${this.config.baseUrl}/v1/chat/completions`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         signal: controller.signal,
-        body: JSON.stringify({
-          model: request.model ?? this.config.defaultModel,
-          temperature: request.temperature ?? this.config.defaultTemperature,
-          max_tokens: request.maxTokens ?? this.config.defaultMaxTokens,
-          messages: request.messages,
-          ...((request.keepAlive ?? this.config.keepAlive) !== undefined && this.name === "ollama" ? { keep_alive: request.keepAlive ?? this.config.keepAlive } : {}),
-          ...(request.nativeTools && this.supportsNativeToolCalling ? { tools: request.nativeTools.map((tool) => ({ type: "function", function: tool })) , tool_choice: "auto" } : {}),
-          ...(request.responseSchema && this.supportsStructuredOutput ? {
-            response_format: {
-              type: "json_schema",
-              json_schema: { name: "vytronix_output", strict: true, schema: request.responseSchema }
-            }
-          } : {})
-        })
+        body: JSON.stringify(requestPayload)
       });
       const payload = (await response.json()) as OpenAiCompatiblePayload;
 
       if (!response.ok) {
+        if (request.diagnostic) {
+          logSafeDiagnostic({
+            event: "llm_provider_upstream_error",
+            provider: this.name,
+            stage: request.diagnostic.stage,
+            correlationId: request.diagnostic.correlationId,
+            agent: request.diagnostic.agent,
+            toolName: request.diagnostic.toolName,
+            upstreamStatus: response.status,
+            upstreamCode: payload.error?.code,
+            upstreamMessage: sanitizeProviderMessage(payload.error?.message)
+          });
+        }
         throw new AppError("LLM provider returned an error", {
           code: "LLM_UPSTREAM_ERROR",
           status: 502,
@@ -69,7 +140,7 @@ export class OpenAiCompatibleProvider implements LlmProvider {
             provider: this.name,
             upstreamStatus: response.status,
             upstreamCode: payload.error?.code,
-            upstreamMessage: payload.error?.message?.slice(0, 500)
+            upstreamMessage: sanitizeProviderMessage(payload.error?.message)
           }
         });
       }
