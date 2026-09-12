@@ -16,11 +16,15 @@ import { llmService } from "@/ai/llm/llm.service";
 import { AppError } from "@/lib/errors";
 import { executeStructuredOutput } from "@/ai/structured-output/structured-output";
 import { buildRetrievedKnowledgeMessage, ragContextSchema } from "@/ai/rag/rag-context";
-import { buildSelectionDirective, selectTool } from "@/ai/tools/tool-selector";
+import { buildSelectionDirective, resolveCurrentMutationIntent, selectTool } from "@/ai/tools/tool-selector";
 import { resolveToolRoutingStrategy } from "@/ai/tools/tool-routing";
 import { extractToolArguments } from "@/ai/tools/tool-argument-extractor";
 import { groundToolArguments } from "@/ai/tools/tool-argument-grounding";
+import { currentTurnText } from "@/ai/tools/tool-argument-grounding";
+import { refersToSelection, selectedContinuation, continuationArgumentTool, safeContinuationTurn } from "@/ai/tools/tool-continuation";
+import { logDateGroundingDiagnostic } from "@/ai/tools/tool-date-diagnostic";
 import { resolveCurrentDate, temporalContextSchema } from "@/ai/tools/tool-temporal-context";
+import { groundAuthoritativeToolResult, informationalResponseAuthority, responseAuthorityFromToolResult, safeToolResultFallback } from "@/ai/tools/tool-result-grounding";
 import {
   buildToolAwareSchema,
   buildRespondOnlySchema,
@@ -33,6 +37,7 @@ import {
   buildToolOrchestrationInstructions,
   buildToolAwareSystemPrompt,
   buildToolResultFollowUpSystemPrompt,
+  progressionEvidenceSchema,
   toolResultSchema,
   toolsSchema,
   validateToolCall,
@@ -47,9 +52,10 @@ const runRequestSchema = z.object({
   ragContext: ragContextSchema.optional(),
   tools: toolsSchema.optional(),
   toolResult: toolResultSchema.optional(),
+  progressionEvidence: progressionEvidenceSchema.optional(),
   temporalContext: temporalContextSchema.optional(),
   diagnosticCorrelationId: z.string().uuid().optional()
-});
+}).strict();
 
 const agentRegistry = {
   lead: leadAgent,
@@ -348,6 +354,35 @@ const buildOutOfScopeOutput = (agent: AgentName, reason: string): unknown => {
   };
 };
 
+const buildAuthoritativeToolResultOutput = (agent: AgentName, userFacingSummary: string): unknown => {
+  if (agent === "lead") {
+    return { summary: userFacingSummary, detected_service: "unknown", lead_temperature: "cold", missing_information: [], suggested_next_action: userFacingSummary, reply_to_client: userFacingSummary, is_in_scope: true, out_of_scope_reason: null, safe_reply: userFacingSummary };
+  }
+  if (agent === "landing") {
+    return { project_summary: userFacingSummary, recommended_template: "not_applicable", primary_cta: "not_applicable", secondary_cta: "not_applicable", suggested_sections: ["N/A"], missing_information: [], brief_markdown: userFacingSummary, is_in_scope: true, out_of_scope_reason: null, safe_reply: userFacingSummary };
+  }
+  if (agent === "proposal") {
+    return { proposal_title: "Resultado de operacion", executive_summary: userFacingSummary, scope: ["N/A"], deliverables: ["N/A"], assumptions: [], next_steps: [userFacingSummary], is_in_scope: true, out_of_scope_reason: null, safe_reply: userFacingSummary };
+  }
+  return { category: "general", priority: "low", summary: userFacingSummary, suggested_reply: userFacingSummary, escalate_to_human: false, is_in_scope: true, out_of_scope_reason: null, safe_reply: userFacingSummary };
+};
+
+export const UNAUTHORIZED_MUTATION_REPLY = "La accion solicitada todavia no se realizo. Debe ejecutarse y, cuando corresponda, confirmarse antes de considerarla completada.";
+
+export const groundModelGeneratedPublicOutput = (params: {
+  agent: AgentName;
+  input: unknown;
+  output: unknown;
+}): { output: unknown; replaced: boolean } => {
+  if (!resolveCurrentMutationIntent(params.input)) return { output: params.output, replaced: false };
+  return {
+    output: getAgentDefinition(params.agent).outputSchema.parse(
+      buildAuthoritativeToolResultOutput(params.agent, UNAUTHORIZED_MUTATION_REPLY),
+    ),
+    replaced: true,
+  };
+};
+
 export const runAgent = async (request: AgentRunRequest): Promise<AgentRunResult> => {
   const parsedRequest = runRequestSchema.parse(request);
   const temporalContext = { currentDate: resolveCurrentDate(parsedRequest.temporalContext) };
@@ -359,7 +394,7 @@ export const runAgent = async (request: AgentRunRequest): Promise<AgentRunResult
   const greeting = parsedRequest.agent === "support" && !parsedRequest.ragContext && !parsedRequest.toolResult && isPureGreeting(rawInput?.ticketMessage);
   if (greeting) {
     const output = agentDefinition.outputSchema.parse({ category: "general", priority: "low", summary: "Saludo inicial.", suggested_reply: "Hola, ¿en qué puedo ayudarte?", escalate_to_human: false, is_in_scope: true, out_of_scope_reason: null, safe_reply: "Hola, ¿en qué puedo ayudarte?" });
-    return { agent: parsedRequest.agent, mode: effectiveMode, parsedOutput: output, rawOutput: JSON.stringify(output), model: "deterministic-greeting", provider: "internal", attemptCount: 0, durationMs: 0 };
+    return { agent: parsedRequest.agent, mode: effectiveMode, parsedOutput: output, rawOutput: JSON.stringify(output), model: "deterministic-greeting", provider: "internal", attemptCount: 0, durationMs: 0, responseAuthority: informationalResponseAuthority() };
   }
 
   const parsedInput = agentDefinition.inputSchema.safeParse(parsedRequest.input);
@@ -384,7 +419,8 @@ export const runAgent = async (request: AgentRunRequest): Promise<AgentRunResult
       model: "policy-guardrail",
       provider: "internal",
       attemptCount: 0,
-      durationMs: 1
+      durationMs: 1,
+      responseAuthority: informationalResponseAuthority()
     };
   }
 
@@ -397,19 +433,79 @@ export const runAgent = async (request: AgentRunRequest): Promise<AgentRunResult
   if (parsedRequest.toolResult && availableTools.length > 0 && !availableTools.some((tool) => tool.name === parsedRequest.toolResult?.toolName)) {
     throw new AppError("Tool result does not match an available tool", { code: "TOOL_RESULT_INVALID", status: 400 });
   }
+  const authoritativeTool = parsedRequest.toolResult
+    ? availableTools.find((tool) => tool.name === parsedRequest.toolResult?.toolName)
+    : undefined;
+  const authoritativeGrounding = parsedRequest.toolResult && authoritativeTool
+    ? groundAuthoritativeToolResult(authoritativeTool, parsedRequest.toolResult)
+    : null;
+  if (authoritativeGrounding && authoritativeTool && parsedRequest.toolResult) {
+    const parsedOutput = agentDefinition.outputSchema.parse(buildAuthoritativeToolResultOutput(parsedRequest.agent, authoritativeGrounding.userFacingSummary));
+    const durationMs = Date.now() - startedAt;
+    return {
+      agent: parsedRequest.agent,
+      mode: effectiveMode,
+      parsedOutput,
+      rawOutput: JSON.stringify(parsedOutput),
+      model: "deterministic-tool-result",
+      provider: "internal",
+      attemptCount: 0,
+      durationMs,
+      responseAuthority: responseAuthorityFromToolResult(authoritativeTool, parsedRequest.toolResult, authoritativeGrounding),
+      totalDurationMs: durationMs,
+      agentDurationMs: 0,
+      toolDiagnostics: { finalAction: "RESPOND", enforcementPassed: authoritativeGrounding.validationPassed, argumentsPresent: false, argumentsValid: false, argumentIssueCount: authoritativeGrounding.validationPassed ? 0 : 1 },
+      structuredOutputRequested: false,
+      structuredOutputProviderSupported: llmService.supportsStructuredOutput,
+      structuredOutputMode: "TEXT_FALLBACK",
+      toolRoutingStrategy: "TOOL_RESULT_RESPOND",
+      nativePathUsed: false,
+      selectorPathUsed: false,
+      structuredOutputUsed: false,
+    };
+  }
   const routingStrategy = resolveToolRoutingStrategy({ tools: availableTools, ragContext: parsedRequest.ragContext, toolResult: parsedRequest.toolResult, supportsNativeToolCalling: llmService.supportsNativeToolCalling });
   const separatedToolDecision = availableTools.length > 0 && !parsedRequest.toolResult;
   const nativeToolCalling = routingStrategy === "NATIVE" && !separatedToolDecision;
-  const toolSelection = (routingStrategy === "SELECTOR" || separatedToolDecision) ? await selectTool({ agent: parsedRequest.agent, input: parsedInput.data, tools: availableTools, toolResult: parsedRequest.toolResult, correlationId: parsedRequest.diagnosticCorrelationId }) : null;
-  const argumentExtraction = toolSelection?.decision.decision === "USE_TOOL" && toolSelection.selectedTool
-    ? await extractToolArguments({ input: parsedInput.data, tool: toolSelection.selectedTool, correlationId: parsedRequest.diagnosticCorrelationId, currentDate: temporalContext.currentDate })
+  const toolSelection = (routingStrategy === "SELECTOR" || separatedToolDecision) ? await selectTool({ agent: parsedRequest.agent, input: parsedInput.data, tools: availableTools, toolResult: parsedRequest.toolResult, correlationId: parsedRequest.diagnosticCorrelationId, progressionEvidence: parsedRequest.progressionEvidence }) : null;
+  const continuation = toolSelection?.selectedTool && refersToSelection(currentTurnText(parsedInput.data))
+    ? selectedContinuation(toolSelection.selectedTool, availableTools, parsedRequest.progressionEvidence) : undefined;
+  const argumentTool = toolSelection?.selectedTool && continuation ? continuationArgumentTool(toolSelection.selectedTool) : toolSelection?.selectedTool;
+  const argumentInput = continuation ? { ticketMessage: currentTurnText(parsedInput.data) } : parsedInput.data;
+  const argumentExtraction = toolSelection?.decision.decision === "USE_TOOL" && argumentTool
+    ? await extractToolArguments({ input: argumentInput, tool: argumentTool, correlationId: parsedRequest.diagnosticCorrelationId, currentDate: temporalContext.currentDate })
     : undefined;
   const groundedArguments = argumentExtraction?.status === "SUCCESS" && toolSelection?.selectedTool
-    ? groundToolArguments(parsedInput.data, toolSelection.selectedTool, argumentExtraction.arguments ?? {}, temporalContext)
+    ? groundToolArguments(argumentInput, argumentTool!, argumentExtraction.arguments ?? {}, temporalContext)
     : undefined;
+  const logDateDecision = (routerDecision: "CALL_TOOL" | "CLARIFICATION" | "OTHER", finalValidationRan = false) => {
+    if (toolSelection?.selectedTool && argumentExtraction) logDateGroundingDiagnostic({
+      correlationId: parsedRequest.diagnosticCorrelationId,
+      tool: toolSelection.selectedTool,
+      input: parsedInput.data,
+      temporalContext: parsedRequest.temporalContext,
+      extractedArguments: argumentExtraction.arguments,
+      grounding: groundedArguments,
+      finalValidationRan,
+      routerDecision
+    });
+  };
   if (groundedArguments?.status === "READY" && toolSelection?.selectedTool && argumentExtraction) {
     const totalDurationMs = Date.now() - startedAt;
-    const assembledCall = assembleToolCall(toolSelection.selectedTool, groundedArguments.arguments);
+    let assembledCall: ReturnType<typeof assembleToolCall>;
+    try {
+      if (continuation && (!safeContinuationTurn(currentTurnText(parsedInput.data), groundedArguments.arguments) ||
+        selectedContinuation(toolSelection.selectedTool, availableTools, parsedRequest.progressionEvidence)?.continuationKey !== continuation.continuationKey)) {
+        throw new AppError("Continuation requires an unambiguous current selection", { code: "TOOL_CONTINUATION_INVALID", status: 422 });
+      }
+      // Partial validation applies ONLY to the explicit continuation proposal.
+      // The original execution schema remains mandatory in the orchestrator.
+      assembledCall = assembleToolCall(argumentTool!, groundedArguments.arguments);
+    } catch (error) {
+      logDateDecision("OTHER", true);
+      throw error;
+    }
+    logDateDecision("CALL_TOOL", true);
     return {
       agent: parsedRequest.agent,
       mode: effectiveMode,
@@ -420,6 +516,7 @@ export const runAgent = async (request: AgentRunRequest): Promise<AgentRunResult
       attemptCount: argumentExtraction.attempts,
       repairAttempt: argumentExtraction.repairAttempt,
       durationMs: totalDurationMs,
+      responseAuthority: informationalResponseAuthority(),
       totalDurationMs,
       agentDurationMs: 0,
       toolSelection: { selectorUsed: true, selectorSkipped: false, selectorDecision: "USE_TOOL", selectedToolName: toolSelection.selectedTool.name, selectorAttempts: toolSelection.attempts, selectorRepair: toolSelection.repairAttempt, selectorValid: true, selectorDurationMs: toolSelection.durationMs, diagnostics: toolSelection.diagnostics },
@@ -431,7 +528,8 @@ export const runAgent = async (request: AgentRunRequest): Promise<AgentRunResult
       nativePathUsed: false,
       selectorPathUsed: true,
       structuredOutputUsed: llmService.supportsStructuredOutput,
-      orchestration: { ...assembledCall, toolCall: { ...assembledCall.toolCall, toolCallId: randomUUID() } }
+      orchestration: { ...assembledCall, toolCall: { ...assembledCall.toolCall, toolCallId: randomUUID(),
+        ...(continuation ? { continuation: { executionId: continuation.executionId, bindingKey: continuation.continuationKey! } } : {}) } }
     };
   }
   if (toolSelection?.decision.decision === "USE_TOOL" && toolSelection.selectedTool && argumentExtraction && parsedRequest.agent === "support") {
@@ -443,6 +541,7 @@ export const runAgent = async (request: AgentRunRequest): Promise<AgentRunResult
     if (missingArguments.length > 0) {
       const totalDurationMs = Date.now() - startedAt;
       const output = assembleSupportToolClarificationOutput(toolSelection.selectedTool, missingArguments);
+      logDateDecision("CLARIFICATION");
       return {
         agent: parsedRequest.agent,
         mode: effectiveMode,
@@ -453,6 +552,7 @@ export const runAgent = async (request: AgentRunRequest): Promise<AgentRunResult
         attemptCount: argumentExtraction.attempts,
         repairAttempt: argumentExtraction.repairAttempt,
         durationMs: totalDurationMs,
+        responseAuthority: informationalResponseAuthority(),
         totalDurationMs,
         agentDurationMs: 0,
         toolSelection: { selectorUsed: true, selectorSkipped: false, selectorDecision: "USE_TOOL", selectedToolName: toolSelection.selectedTool.name, selectorAttempts: toolSelection.attempts, selectorRepair: toolSelection.repairAttempt, selectorValid: true, selectorDurationMs: toolSelection.durationMs, diagnostics: toolSelection.diagnostics },
@@ -470,6 +570,7 @@ export const runAgent = async (request: AgentRunRequest): Promise<AgentRunResult
   // Failed extraction/grounding must not fall through to a legacy generation
   // using the original schema, which can still contain canonical ID properties.
   if (argumentExtraction && groundedArguments?.status !== "READY") {
+    logDateDecision("OTHER");
     throw new AppError("Tool arguments could not be grounded", { code: "TOOL_ARGUMENTS_INVALID", status: 422 });
   }
   const enforcedToolSelection = groundedArguments && groundedArguments.status !== "READY" ? null : toolSelection;
@@ -657,9 +758,14 @@ export const runAgent = async (request: AgentRunRequest): Promise<AgentRunResult
     }
   });
   const output = execution.parsedOutput as ToolAwareOutput<unknown>;
-  const parsedOutput = supportToolResultFollowUp
-    ? assembleSupportToolResultOutput(execution.parsedOutput as SupportToolResultFollowUpOutput)
-    : execution.parsedOutput;
+  const legacyToolResultFallback = parsedRequest.toolResult
+    ? safeToolResultFallback(availableTools.find((tool) => tool.name === parsedRequest.toolResult?.toolName), parsedRequest.toolResult.status)
+    : undefined;
+  const parsedOutput = legacyToolResultFallback
+    ? agentDefinition.outputSchema.parse(buildAuthoritativeToolResultOutput(parsedRequest.agent, legacyToolResultFallback))
+    : supportToolResultFollowUp
+      ? assembleSupportToolResultOutput(execution.parsedOutput as SupportToolResultFollowUpOutput)
+      : execution.parsedOutput;
   const assembledResponse = domainOnlyResponse ? assembleRespond(parsedOutput) : output;
   const orchestration = assembledResponse.action === "CALL_TOOL" && validatedToolCall
     ? { action: "CALL_TOOL" as const, toolCall: validatedToolCall }
@@ -667,12 +773,21 @@ export const runAgent = async (request: AgentRunRequest): Promise<AgentRunResult
   if (parsedRequest.toolResult && assembledResponse.action !== "RESPOND") {
     throw new AppError("Tool result did not produce a final response", { code: "TOOL_RESULT_INVALID", status: 502 });
   }
+  const publicOutput = domainOnlyResponse
+    ? parsedOutput
+    : usesToolContract
+      ? (output.action === "CALL_TOOL" ? null : output.result)
+      : execution.parsedOutput;
+  const responseIsPublic = !usesToolContract || assembledResponse.action === "RESPOND";
+  const groundedPublicOutput = !parsedRequest.toolResult && responseIsPublic && publicOutput !== null
+    ? groundModelGeneratedPublicOutput({ agent: parsedRequest.agent, input: parsedInput.data, output: publicOutput })
+    : { output: publicOutput, replaced: false };
   const totalDurationMs = Date.now() - startedAt;
   return {
         agent: parsedRequest.agent,
         mode: effectiveMode,
-        parsedOutput: domainOnlyResponse ? parsedOutput : usesToolContract ? (output.action === "CALL_TOOL" ? null : output.result) : execution.parsedOutput,
-        rawOutput: execution.rawOutput,
+        parsedOutput: groundedPublicOutput.output,
+        rawOutput: groundedPublicOutput.replaced ? JSON.stringify(groundedPublicOutput.output) : execution.rawOutput,
         model: execution.response.model,
         provider: execution.response.provider,
         usage: execution.response.usage,
@@ -680,6 +795,7 @@ export const runAgent = async (request: AgentRunRequest): Promise<AgentRunResult
         repairAttempt: execution.repairAttempt,
         diagnostics: execution.diagnostics,
         durationMs: totalDurationMs,
+        responseAuthority: informationalResponseAuthority(),
         totalDurationMs,
         agentDurationMs: Date.now() - agentStartedAt,
         toolSelection: selectorDiagnostics,

@@ -11,6 +11,18 @@ export type ToolArgumentGroundingResult = {
 
 const inputText = (input: unknown): string => JSON.stringify(input).toLocaleLowerCase("es");
 
+const CURRENT_TURN_FIELDS = ["ticketMessage", "leadMessage", "objective", "businessGoal", "request", "message", "brief"] as const;
+
+export const currentTurnText = (input: unknown): string => {
+  if (typeof input === "string") return input;
+  if (!input || typeof input !== "object" || Array.isArray(input)) return "";
+  const record = input as Record<string, unknown>;
+  for (const field of CURRENT_TURN_FIELDS) {
+    if (typeof record[field] === "string" && record[field].trim()) return record[field];
+  }
+  return "";
+};
+
 export const normalizeRelativeDate = (value: unknown): unknown => {
   if (typeof value !== "string") return value;
   const normalized = value.trim().toLocaleLowerCase("es");
@@ -24,23 +36,30 @@ const hasTimeEvidence = (text: string): boolean => /\b(?:[01]?\d|2[0-3]):[0-5]\d
 
 export const groundToolArguments = (input: unknown, tool: ToolDefinition, argumentsValue: Record<string, unknown>, temporalContext?: TemporalContext): ToolArgumentGroundingResult => {
   const text = inputText(input);
+  const temporalEvidence = currentTurnText(input);
   const grounded = { ...argumentsValue };
   const missing: string[] = [];
   const ungrounded: string[] = [];
   const schema = buildExtractionSchema(tool.inputSchema);
   const required = schema.required ?? [];
+  for (const [field, value] of Object.entries(grounded)) {
+    if (schema.properties?.[field]?.type === "string" && !required.includes(field) && field.endsWith("Ref") && typeof value === "string" && !value.trim()) delete grounded[field];
+  }
   const currentDate = resolveCurrentDate(temporalContext);
   for (const field of new Set([...required, ...Object.keys(grounded)])) {
     if (!Object.hasOwn(schema.properties ?? {}, field)) { ungrounded.push(field); continue; }
+    const property = schema.properties?.[field];
+    if (property?.format === "date") {
+      const date = dateFromEvidence(temporalEvidence, currentDate);
+      if (!date) { missing.push(field); ungrounded.push(field); continue; }
+      grounded[field] = date;
+      continue;
+    }
     if (!(field in grounded) || grounded[field] === undefined || grounded[field] === null || grounded[field] === "") {
       missing.push(field);
       continue;
     }
-    if (field === "date") {
-      const date = dateFromEvidence(text, currentDate);
-      if (!date) { missing.push(field); ungrounded.push(field); continue; }
-      grounded[field] = date;
-    } else if (field === "time") {
+    if (field === "time") {
       if (!hasTimeEvidence(text)) { missing.push(field); ungrounded.push(field); continue; }
     } else if (typeof grounded[field] === "string" && !text.includes(String(grounded[field]).toLocaleLowerCase("es"))) {
       ungrounded.push(field);

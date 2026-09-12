@@ -11,6 +11,58 @@ export const TOOL_MAX_RESULT_CHARS = 16000;
 export const TOOL_SELECTION_HINT_MAX_CHARS = 500;
 export const TOOL_SELECTION_HINT_MAX_CONCEPTS = 8;
 export const TOOL_SELECTION_HINT_MAX_CONCEPT_CHARS = 80;
+export const TOOL_PROGRESSION_EVIDENCE_MAX_COUNT = 4;
+export const TOOL_PROGRESSION_EVIDENCE_MAX_AGE_SECONDS = 3600;
+export const TOOL_RESULT_PRESENTATION_MAX_CHARS = 200;
+
+export const toolEffectSchema = z.enum(["NONE", "CREATED", "UPDATED", "CANCELLED", "DELETED", "SENT", "CHARGED"]);
+export type ToolEffect = z.infer<typeof toolEffectSchema>;
+
+export const toolProgressionEvidenceSchema = z.object({
+  executionId: z.string().uuid(),
+  targetTool: z.string().regex(/^[a-z0-9_]+$/).min(1).max(80),
+  prerequisiteTool: z.string().regex(/^[a-z0-9_]+$/).min(1).max(80),
+  status: z.literal("SUCCEEDED"),
+  scopeKey: z.string().regex(/^[a-zA-Z0-9_-]+$/).min(16).max(128),
+  continuationKey: z.string().regex(/^[a-f0-9]{64}$/).optional(),
+  completedAt: z.iso.datetime({ offset: true }),
+  expiresAt: z.iso.datetime({ offset: true })
+}).strict().superRefine((evidence, context) => {
+  const completedAt = Date.parse(evidence.completedAt);
+  const expiresAt = Date.parse(evidence.expiresAt);
+  if (expiresAt <= completedAt) {
+    context.addIssue({ code: z.ZodIssueCode.custom, path: ["expiresAt"], message: "expiresAt must be after completedAt" });
+  } else if (expiresAt - completedAt > TOOL_PROGRESSION_EVIDENCE_MAX_AGE_SECONDS * 1000) {
+    context.addIssue({ code: z.ZodIssueCode.custom, path: ["expiresAt"], message: "progression evidence lifetime is too long" });
+  }
+});
+
+export const progressionEvidenceSchema = z.array(toolProgressionEvidenceSchema).max(TOOL_PROGRESSION_EVIDENCE_MAX_COUNT);
+export type ToolProgressionEvidence = z.infer<typeof toolProgressionEvidenceSchema>;
+
+// Wire metadata uses exact allowlisted tool names, not domain capability keys.
+// Every prerequisite is required (AND). Canonical scope stays in the orchestrator.
+export const toolProgressionSchema = z.object({
+  prerequisites: z.array(z.object({
+    prerequisiteTool: z.string().regex(/^[a-z0-9_]+$/).min(1).max(80),
+    maxAgeSeconds: z.number().int().min(1).max(TOOL_PROGRESSION_EVIDENCE_MAX_AGE_SECONDS)
+  }).strict()).min(1).max(TOOL_PROGRESSION_EVIDENCE_MAX_COUNT),
+  continuation: z.object({
+    argumentFields: z.array(z.string().regex(/^[a-zA-Z][a-zA-Z0-9_]{0,79}$/)).min(1).max(8)
+      .refine((fields) => new Set(fields).size === fields.length)
+  }).strict().optional()
+}).strict().superRefine((value, context) => {
+  if (new Set(value.prerequisites.map((item) => item.prerequisiteTool)).size !== value.prerequisites.length) {
+    context.addIssue({ code: z.ZodIssueCode.custom, path: ["prerequisites"], message: "Prerequisites must be unique" });
+  }
+});
+
+export const toolResultPolicySchema = z.object({ successEffect: toolEffectSchema }).strict();
+export const toolResultPresentationSchema = z.object({
+  performedEffect: toolEffectSchema,
+  userFacingSummary: z.string().trim().min(1).max(TOOL_RESULT_PRESENTATION_MAX_CHARS)
+}).strict();
+export type ToolResultPresentation = z.infer<typeof toolResultPresentationSchema>;
 
 const jsonSchemaType = z.enum(["string", "number", "integer", "boolean", "object", "array"]);
 type JsonSchemaNode = { type?: z.infer<typeof jsonSchemaType>; title?: string; properties?: Record<string, JsonSchemaNode>; required?: string[]; items?: JsonSchemaNode; additionalProperties?: boolean; enum?: unknown[]; format?: "uuid" | "date" | "date-time" | "email"; minLength?: number; maxLength?: number };
@@ -44,8 +96,17 @@ export const toolDefinitionSchema = z.object({
   selectionHints: z.object({
     whenToUse: z.string().trim().min(1).max(TOOL_SELECTION_HINT_MAX_CHARS).optional(),
     concepts: z.array(z.string().trim().min(1).max(TOOL_SELECTION_HINT_MAX_CONCEPT_CHARS)).max(TOOL_SELECTION_HINT_MAX_CONCEPTS).optional()
-  }).strict().optional()
-}).strict();
+  }).strict().optional(),
+  resultPolicy: toolResultPolicySchema.optional(),
+  progression: toolProgressionSchema.optional()
+}).strict().superRefine((tool, context) => {
+  if (tool.progression && (tool.sideEffect !== "WRITE" || !tool.requiresConfirmation || tool.progression.prerequisites.some((item) => item.prerequisiteTool === tool.name))) {
+    context.addIssue({ code: z.ZodIssueCode.custom, path: ["progression"], message: "Progression requires a confirmed WRITE with distinct prerequisites" });
+  }
+  if (tool.sideEffect === "READ_ONLY" && tool.resultPolicy && tool.resultPolicy.successEffect !== "NONE") {
+    context.addIssue({ code: z.ZodIssueCode.custom, path: ["resultPolicy", "successEffect"], message: "READ_ONLY tools can only declare NONE" });
+  }
+});
 
 export const toolsSchema = z.array(toolDefinitionSchema).max(TOOL_MAX_COUNT).superRefine((tools, context) => {
   const names = new Set<string>();
@@ -76,10 +137,11 @@ export const assembleRespond = <T>(validatedDomainOutput: T) => ({
 export const toolResultSchema = z.object({
   toolCallId: z.string().regex(/^[a-zA-Z0-9_-]+$/).min(1).max(100),
   toolName: z.string().regex(/^[a-z0-9_]+$/).min(1).max(80),
-  status: z.enum(["SUCCEEDED", "FAILED", "DENIED", "CONFIRMATION_REQUIRED"]),
+  status: z.enum(["SUCCEEDED", "FAILED", "DENIED", "CONFIRMATION_REQUIRED", "PENDING_CONFIRMATION"]),
   output: z.unknown().optional(),
   error: z.string().max(2000).optional(),
-  errorCode: z.string().min(1).max(100).optional()
+  errorCode: z.string().min(1).max(100).optional(),
+  presentation: toolResultPresentationSchema.optional()
 }).strict().superRefine((result, context) => {
   if (result.output !== undefined && JSON.stringify(result.output).length > TOOL_MAX_RESULT_CHARS) context.addIssue({ code: z.ZodIssueCode.too_big, maximum: TOOL_MAX_RESULT_CHARS, inclusive: true, origin: "string", path: ["output"], message: "Tool result is too large" });
 });

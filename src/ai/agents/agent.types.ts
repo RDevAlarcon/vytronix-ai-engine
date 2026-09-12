@@ -2,7 +2,7 @@ import { z } from "zod";
 import type { ChatMessage } from "@/ai/llm/llm.types";
 import type { StructuredOutputDiagnostic } from "@/ai/structured-output/structured-output";
 import type { RagContext } from "@/ai/rag/rag-context";
-import type { ToolDefinition, ToolResult } from "@/ai/tools/tool-contract";
+import type { ToolDefinition, ToolEffect, ToolProgressionEvidence, ToolResult } from "@/ai/tools/tool-contract";
 import type { TemporalContext } from "@/ai/tools/tool-temporal-context";
 
 export type AgentName = "lead" | "landing" | "proposal" | "support";
@@ -21,6 +21,18 @@ export type AgentDefinition<TInput, TOutput> = {
   };
 };
 
+export type AgentResponseAuthority =
+  | {
+      kind: "INFORMATIONAL";
+      performedEffect: "NONE";
+    }
+  | {
+      kind: "AUTHORITATIVE_WRITE";
+      performedEffect: Exclude<ToolEffect, "NONE">;
+      toolName: string;
+      toolCallId: string;
+    };
+
 export type AgentRunRequest = {
   agent: AgentName;
   input: unknown;
@@ -28,6 +40,7 @@ export type AgentRunRequest = {
   ragContext?: RagContext;
   tools?: ToolDefinition[];
   toolResult?: ToolResult;
+  progressionEvidence?: ToolProgressionEvidence[];
   diagnosticCorrelationId?: string;
   temporalContext?: TemporalContext;
 };
@@ -48,6 +61,7 @@ export type AgentRunResult<TOutput = unknown> = {
   repairAttempt?: boolean;
   diagnostics?: StructuredOutputDiagnostic[];
   durationMs: number;
+  responseAuthority: AgentResponseAuthority;
   totalDurationMs?: number;
   agentDurationMs?: number;
   toolSelection?: {
@@ -83,6 +97,7 @@ export type AgentRunResult<TOutput = unknown> = {
       toolName: string;
       arguments: Record<string, unknown>;
       requiresConfirmation: boolean;
+      continuation?: { executionId: string; bindingKey: string };
     };
   };
 };

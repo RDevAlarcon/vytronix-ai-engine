@@ -25,6 +25,45 @@ const months = [
   ["octubre", "october"], ["noviembre", "november"], ["diciembre", "december"]
 ];
 
+const weekdayNumbers = new Map<string, number>([
+  ["domingo", 0], ["sunday", 0],
+  ["lunes", 1], ["monday", 1],
+  ["martes", 2], ["tuesday", 2],
+  ["miercoles", 3], ["wednesday", 3],
+  ["jueves", 4], ["thursday", 4],
+  ["viernes", 5], ["friday", 5],
+  ["sabado", 6], ["saturday", 6]
+]);
+
+const weekdayPattern = /\b(domingo|sunday|lunes|monday|martes|tuesday|miercoles|wednesday|jueves|thursday|viernes|friday|sabado|saturday)\b/g;
+
+const dateAfterDays = (date: string, days: number): string | undefined => {
+  if (!z.iso.date().safeParse(date).success) return undefined;
+  const [year, month, day] = date.split("-").map(Number);
+  const value = new Date(Date.UTC(year!, month! - 1, day! + days));
+  return value.toISOString().slice(0, 10);
+};
+
+const weekdayFromEvidence = (text: string, currentDate: string): string | undefined => {
+  const matches = [...text.matchAll(weekdayPattern)];
+  if (matches.length !== 1) return undefined;
+  const match = matches[0]!;
+  const before = text.slice(0, match.index);
+  const after = text.slice(match.index! + match[0].length);
+  // Keep weekday evidence deliberately narrow. Relative modifiers and parts of
+  // day remain clarification cases instead of becoming guessed dates.
+  if (/\b(?:someday|sometime|later|weekend|next week|this weekend)\b/.test(text)) return undefined;
+  if (/\b(?:next|this|last|previous|proximo)\s+$/.test(before)) return undefined;
+  if (/^\s+(?:que viene|siguiente|next week|por la tarde|en la noche|afternoon|evening|night)\b/.test(after)) return undefined;
+  const targetWeekday = weekdayNumbers.get(match[0]);
+  const current = dateAfterDays(currentDate, 0);
+  if (targetWeekday === undefined || !current) return undefined;
+  const [year, month, day] = current.split("-").map(Number);
+  const currentWeekday = new Date(Date.UTC(year!, month! - 1, day!)).getUTCDay();
+  const daysAhead = (targetWeekday - currentWeekday + 7) % 7;
+  return daysAhead === 0 ? undefined : dateAfterDays(current, daysAhead);
+};
+
 // Return no date for absent, impossible or conflicting evidence. Never use model output.
 export function dateFromEvidence(text: string, currentDate: string): string | undefined {
   const normalized = text.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase();
@@ -39,12 +78,16 @@ export function dateFromEvidence(text: string, currentDate: string): string | un
     const month = months.findIndex((names) => names.includes(match[2]!));
     if (month >= 0) dates.add(`${match[3] ?? currentDate.slice(0, 4)}-${String(month + 1).padStart(2, "0")}-${match[1]!.padStart(2, "0")}`);
   }
-  // Keep the existing relative-date tokens understood by the caller.
-  const relative = /\b(pasado manana|day_after_tomorrow|day after tomorrow)\b/.test(normalized)
-    ? "day_after_tomorrow" : /\b(manana|tomorrow)\b/.test(normalized)
-      ? "tomorrow" : /\b(hoy|today)\b/.test(normalized) ? "today" : undefined;
-  if (relative) dates.add(relative);
+  const relativeDays = /\b(pasado manana|day_after_tomorrow|day after tomorrow)\b/.test(normalized)
+    ? 2 : /\b(manana|tomorrow)\b/.test(normalized)
+      ? 1 : /\b(hoy|today)\b/.test(normalized) ? 0 : undefined;
+  if (relativeDays !== undefined) {
+    const relativeDate = dateAfterDays(currentDate, relativeDays);
+    if (relativeDate) dates.add(relativeDate);
+  }
+  const weekday = weekdayFromEvidence(normalized, currentDate);
+  if (weekday) dates.add(weekday);
   if (dates.size !== 1) return undefined;
   const value = [...dates][0];
-  return value === relative || z.iso.date().safeParse(value).success ? value : undefined;
+  return z.iso.date().safeParse(value).success ? value : undefined;
 }

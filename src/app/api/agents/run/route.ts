@@ -7,7 +7,7 @@ import { AppError, toErrorMessage, toPublicError } from "@/lib/errors";
 import { enforceApiGuard } from "@/lib/api-guard";
 import { assertRequestBodySize } from "@/lib/request-limits";
 import { ragContextSchema } from "@/ai/rag/rag-context";
-import { toolResultSchema, toolsSchema } from "@/ai/tools/tool-contract";
+import { progressionEvidenceSchema, toolResultSchema, toolsSchema } from "@/ai/tools/tool-contract";
 import { temporalContextSchema } from "@/ai/tools/tool-temporal-context";
 
 export const runtime = "nodejs";
@@ -19,8 +19,9 @@ export const runSchema = z.object({
   ragContext: ragContextSchema.optional(),
   tools: toolsSchema.optional(),
   toolResult: toolResultSchema.optional(),
+  progressionEvidence: progressionEvidenceSchema.optional(),
   temporalContext: temporalContextSchema.optional()
-});
+}).strict();
 
 export async function POST(request: NextRequest) {
   let payload: z.infer<typeof runSchema> | null = null;
@@ -46,6 +47,7 @@ export async function POST(request: NextRequest) {
         agent: result.agent,
         parsedOutput: result.parsedOutput,
         rawOutput: result.rawOutput,
+        responseAuthority: result.responseAuthority,
           metadata: {
           mode: result.mode,
           model: result.model,

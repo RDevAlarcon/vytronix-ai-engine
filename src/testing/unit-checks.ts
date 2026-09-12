@@ -1,5 +1,9 @@
 import "dotenv/config";
+import { runToolDateDiagnosticChecks } from "./tool-date-diagnostic-checks";
+import { runToolProgressionChecks } from "./tool-progression-checks";
+import { runToolResultGroundingChecks } from "./tool-result-grounding-checks";
 import assert from "node:assert/strict";
+import { runToolContinuationChecks } from "@/testing/tool-continuation-checks";
 import { readFileSync } from "node:fs";
 import { isApiKeyValid } from "@/lib/api-guard";
 import { toPublicError, AppError } from "@/lib/errors";
@@ -9,7 +13,7 @@ import { leadInputSchema, leadOutputSchema, supportInputSchema, supportOutputSch
 import { runSchema } from "@/app/api/agents/run/route";
 import { assertInferenceMemoryGate, MEMORY_GATE_FAILURE } from "./memory-gate";
 import { createLlmProvider } from "@/ai/llm/provider.factory";
-import { env, parseEnvBoolean, parseEnvironmentConfigForTest } from "@/lib/env";
+import { parseEnvBoolean, parseEnvironmentConfigForTest } from "@/lib/env";
 import type { LlmProvider } from "@/ai/llm/llm.types";
 import { buildSafeRequestHash } from "@/ai/llm/openai-compatible.provider";
 import { benchmarkCasesSchema } from "../../benchmarks/src/types";
@@ -18,14 +22,14 @@ import { buildStructuredOutputRepairPrompt, executeStructuredOutput, parseStruct
 import { z } from "zod";
 import { classifyAgentScope } from "@/ai/agents/intent.classifier";
 import { selectTool, toolSelectionSchema, buildSelectionDirective, buildToolSelectionDescriptors, buildToolSelectorPrompt, buildToolSelectionResponseSchema, resolveToolSelectionPolicy, TOOL_SELECTOR_SEED } from "@/ai/tools/tool-selector";
-import { buildCompactExtractionDescriptor, buildExtractionSchema, extractToolArguments } from "@/ai/tools/tool-argument-extractor";
+import { buildCompactExtractionDescriptor, buildExtractionSchema, buildPreGroundingExtractionSchema, extractToolArguments } from "@/ai/tools/tool-argument-extractor";
 import { dateFromEvidence, resolveCurrentDate, temporalContextSchema } from "@/ai/tools/tool-temporal-context";
 import { resolveToolRoutingStrategy } from "@/ai/tools/tool-routing";
-import { groundToolArguments, normalizeRelativeDate } from "@/ai/tools/tool-argument-grounding";
+import { currentTurnText, groundToolArguments, normalizeRelativeDate } from "@/ai/tools/tool-argument-grounding";
 import { buildRetrievedKnowledgeMessage, ragContextSchema, RAG_MAX_ITEM_CHARS, RAG_MAX_ITEMS, RAG_MAX_TOTAL_CHARS } from "@/ai/rag/rag-context";
 import { assembleSupportToolResultOutput, humanizeToolArgumentName, inspectSupportToolResultFollowUpShape, normalizeSupportToolResultFollowUpContent, resolveToolArgumentLabel, resolveToolResultFollowUpMaxTokens, runAgent, supportToolResultFollowUpSchema, TOOL_RESULT_FOLLOW_UP_MAX_REPLY_CHARS } from "@/ai/agents/agent.router";
 import { estimateTextTokens } from "@/ai/runtime/inference-input-limits";
-import { assembleToolCall, buildToolAwareSchema, buildToolAwareSystemPrompt, buildToolContext, buildToolOrchestrationInstructions, buildToolResultFollowUpSystemPrompt, buildToolResultMessage, toolDefinitionSchema, toolResultSchema, toolsSchema, validateToolCall, type ToolDefinition, type ToolResult } from "@/ai/tools/tool-contract";
+import { assembleToolCall, buildToolAwareSchema, buildToolAwareSystemPrompt, buildToolContext, buildToolOrchestrationInstructions, buildToolResultFollowUpSystemPrompt, buildToolResultMessage, toolDefinitionSchema, toolResultSchema, toolsSchema, validateToolCall, TOOL_PROGRESSION_EVIDENCE_MAX_COUNT, TOOL_RESULT_PRESENTATION_MAX_CHARS, type ToolDefinition, type ToolResult } from "@/ai/tools/tool-contract";
 
 const config = { baseUrl: "http://provider.test", model: "test-model", temperature: 0.2, maxTokens: 120, timeoutMs: 100, keepAlive: "10m" };
 
@@ -49,6 +53,18 @@ const baseTestEnv = {
   LM_STUDIO_MODEL: "test-model"
 } satisfies NodeJS.ProcessEnv;
 
+const withIsolatedEnvironment = <T>(overrides: NodeJS.ProcessEnv, operation: () => T): T => {
+  const original = { ...process.env };
+  try {
+    for (const key of Object.keys(process.env)) delete process.env[key];
+    Object.assign(process.env, overrides);
+    return operation();
+  } finally {
+    for (const key of Object.keys(process.env)) delete process.env[key];
+    Object.assign(process.env, original);
+  }
+};
+
 const runProviderContract = async (provider: LlmProvider): Promise<void> => {
   const originalFetch = globalThis.fetch;
   const requests: RequestInit[] = [];
@@ -71,6 +87,10 @@ const runProviderContract = async (provider: LlmProvider): Promise<void> => {
 };
 
 const main = async () => {
+  await runToolDateDiagnosticChecks();
+  await runToolProgressionChecks();
+  await runToolContinuationChecks();
+  await runToolResultGroundingChecks();
   assert.equal(isApiKeyValid("correct-key", "correct-key"), true);
   assert.equal(isApiKeyValid("wrong-key", "correct-key"), false);
   assert.equal(isApiKeyValid(null, "correct-key"), false);
@@ -149,6 +169,24 @@ const main = async () => {
   }
 
   assert.equal(runSchema.parse({ agent: "lead", input: {}, mode: "standard" }).mode, "standard");
+  const validProgressionEvidence = {
+    executionId: "00000000-0000-4000-8000-000000000001",
+    targetTool: "booking_create",
+    prerequisiteTool: "booking_check_availability",
+    status: "SUCCEEDED" as const,
+    scopeKey: "scope_0123456789abcdef",
+    completedAt: "2026-09-08T12:00:00.000Z",
+    expiresAt: "2026-09-08T12:05:00.000Z"
+  };
+  assert.equal(runSchema.safeParse({ agent: "support", input: {} }).success, true, "legacy callers must not require progression evidence");
+  assert.deepEqual(runSchema.parse({ agent: "support", input: {}, progressionEvidence: [validProgressionEvidence] }).progressionEvidence, [validProgressionEvidence]);
+  assert.equal(runSchema.safeParse({ agent: "support", input: {}, progressionEvidence: [{ ...validProgressionEvidence, unknown: true }] }).success, false);
+  assert.equal(runSchema.safeParse({ agent: "support", input: {}, progressionEvidence: Array.from({ length: TOOL_PROGRESSION_EVIDENCE_MAX_COUNT + 1 }, () => validProgressionEvidence) }).success, false);
+  assert.equal(runSchema.safeParse({ agent: "support", input: {}, progressionEvidence: [{ ...validProgressionEvidence, status: "FAILED" }] }).success, false);
+  assert.equal(runSchema.safeParse({ agent: "support", input: {}, progressionEvidence: [{ ...validProgressionEvidence, scopeKey: "x".repeat(129) }] }).success, false);
+  assert.equal(runSchema.safeParse({ agent: "support", input: {}, progressionEvidence: [{ ...validProgressionEvidence, completedAt: "not-a-date" }] }).success, false);
+  assert.equal(runSchema.safeParse({ agent: "support", input: {}, progressionEvidence: [{ ...validProgressionEvidence, expiresAt: validProgressionEvidence.completedAt }] }).success, false);
+  assert.equal(runSchema.safeParse({ agent: "support", input: {}, unexpected: true }).success, false);
   assert.equal(resolveToolRoutingStrategy({ supportsNativeToolCalling: true }), "LEGACY");
   assert.equal(runSchema.parse({ agent: "support", input: { ticketMessage: "¿Cuál es el horario de atención?" }, ragContext: { items: [{ content: "Atendemos de lunes a viernes.", sourceId: "kb-1", score: 0.91 }] } }).ragContext?.items[0]?.content, "Atendemos de lunes a viernes.");
   assert.throws(() => runSchema.parse({ agent: "support", input: {}, ragContext: { items: [{ content: "" }] } }));
@@ -343,12 +381,170 @@ const main = async () => {
   for (const [text, expected] of [
     ["3 de septiembre", "2026-09-03"], ["3 de septiembre de 2027", "2027-09-03"],
     ["2027-09-03", "2027-09-03"], ["03/09/2027", "2027-09-03"],
-    ["mañana", "tomorrow"], ["hoy", "today"], ["pasado mañana", "day_after_tomorrow"],
+    ["mañana", "2026-09-04"], ["hoy", "2026-09-03"], ["pasado mañana", "2026-09-05"],
     ["31 de febrero", undefined], ["2026-09-03 o 2026-09-04", undefined], ["sin fecha", undefined]
   ]) assert.equal(dateFromEvidence(text!, "2026-09-03"), expected);
   assert.equal(dateFromEvidence("3 de septiembre", "2031-01-01"), "2031-09-03");
-  assert.equal(groundToolArguments({ ticketMessage: "3 de septiembre" }, readTool, { date: "2023-09-03" }, { currentDate: "2026-09-03" }).arguments.date, "2026-09-03");
-  assert.equal(groundToolArguments({ ticketMessage: "mañana a las 15:00" }, readTool, { date: "2023-10-15" }).status, "READY");
+  for (const [text, expected] of [
+    ["lunes", "2026-09-14"], ["el lunes", "2026-09-14"], ["LUNES", "2026-09-14"],
+    ["viernes", "2026-09-11"], ["domingo", "2026-09-13"],
+    ["miércoles", "2026-09-16"], ["miercoles", "2026-09-16"],
+    ["sábado", "2026-09-12"], ["sabado", "2026-09-12"],
+    ["monday", "2026-09-14"], ["on monday", "2026-09-14"], ["Monday", "2026-09-14"],
+    ["tuesday", "2026-09-15"], ["wednesday", "2026-09-16"],
+    ["friday", "2026-09-11"], ["saturday", "2026-09-12"], ["sunday", "2026-09-13"]
+  ]) assert.equal(dateFromEvidence(text!, "2026-09-10"), expected);
+  assert.equal(dateFromEvidence("jueves", "2026-09-10"), undefined);
+  assert.equal(dateFromEvidence("thursday", "2026-09-10"), undefined);
+  for (const text of ["next week", "viernes por la tarde", "someday", "next monday", "próximo lunes", "lunes que viene"]) {
+    assert.equal(dateFromEvidence(text, "2026-09-10"), undefined);
+  }
+  const weekdayAvailabilityTool: ToolDefinition = {
+    name: "booking_check_availability",
+    description: "Checks appointment availability without creating a booking.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        serviceRef: { type: "string" },
+        resourceRef: { type: "string" },
+        date: { type: "string", format: "date" }
+      },
+      required: ["serviceRef", "resourceRef", "date"],
+      additionalProperties: false
+    },
+    sideEffect: "READ_ONLY",
+    requiresConfirmation: false,
+    selectionHints: {
+      whenToUse: "Use to check current appointment availability for a service, resource, date, or time.",
+      concepts: ["availability", "service reference", "resource reference", "date", "time"]
+    }
+  };
+  const preGroundingSchema = buildPreGroundingExtractionSchema(weekdayAvailabilityTool.inputSchema);
+  assert.deepEqual(preGroundingSchema.required, ["serviceRef", "resourceRef"]);
+  assert.equal(preGroundingSchema.properties?.date?.format, undefined);
+  assert.equal(weekdayAvailabilityTool.inputSchema.properties?.date?.format, "date");
+  assert.doesNotThrow(() => validateToolCall({
+    name: weekdayAvailabilityTool.name,
+    arguments: { serviceRef: "Corte clásico", resourceRef: "Rodrigo", date: "lunes" },
+    requiresConfirmation: false
+  }, [{ ...weekdayAvailabilityTool, inputSchema: preGroundingSchema }]));
+  assert.doesNotThrow(() => validateToolCall({
+    name: weekdayAvailabilityTool.name,
+    arguments: { serviceRef: "Corte clásico", resourceRef: "Rodrigo" },
+    requiresConfirmation: false
+  }, [{ ...weekdayAvailabilityTool, inputSchema: preGroundingSchema }]));
+  const weekdayGrounding = groundToolArguments(
+    { ticketMessage: "¿Tiene Rodrigo disponible el lunes a las 17:00 para un Corte clásico?" },
+    weekdayAvailabilityTool,
+    { serviceRef: "Corte clásico", resourceRef: "Rodrigo", date: "lunes" },
+    { currentDate: "2026-09-10" }
+  );
+  assert.equal(weekdayGrounding.status, "READY");
+  assert.equal(weekdayGrounding.arguments.date, "2026-09-14");
+  assert.match(String(weekdayGrounding.arguments.date), /^\d{4}-\d{2}-\d{2}$/);
+  assert.equal(validateToolCall({ name: weekdayAvailabilityTool.name, arguments: weekdayGrounding.arguments, requiresConfirmation: false }, [weekdayAvailabilityTool]).toolName, "booking_check_availability");
+  assert.throws(() => validateToolCall({ name: weekdayAvailabilityTool.name, arguments: { ...weekdayGrounding.arguments, date: "lunes" }, requiresConfirmation: false }, [weekdayAvailabilityTool]));
+  const duplicatedWeekdayInput = {
+    ticketMessage: "¿Tiene Rodrigo disponible el lunes a las 17:00 para un Corte clásico?",
+    knownContext: "visitor: ¿Tiene Rodrigo disponible el lunes a las 17:00 para un Corte clásico?"
+  };
+  assert.equal(currentTurnText(duplicatedWeekdayInput), duplicatedWeekdayInput.ticketMessage);
+  assert.equal(groundToolArguments(duplicatedWeekdayInput, weekdayAvailabilityTool, {
+    serviceRef: "Corte clásico", resourceRef: "Rodrigo", date: "lunes"
+  }, { currentDate: "2026-09-10" }).arguments.date, "2026-09-14");
+  const historyOnlyWeekday = groundToolArguments({
+    ticketMessage: "Quiero consultar una fecha disponible.",
+    knownContext: "visitor: el lunes"
+  }, weekdayAvailabilityTool, { serviceRef: "Corte clásico", resourceRef: "Rodrigo", date: "lunes" }, { currentDate: "2026-09-10" });
+  assert.equal(historyOnlyWeekday.status, "MISSING_INFORMATION");
+  assert.ok(historyOnlyWeekday.missing.includes("date"));
+  assert.equal(groundToolArguments({ ticketMessage: "el martes", knownContext: "visitor: el lunes" }, weekdayAvailabilityTool, {
+    serviceRef: "Corte clásico", resourceRef: "Rodrigo", date: "lunes"
+  }, { currentDate: "2026-09-10" }).arguments.date, "2026-09-15");
+  assert.equal(groundToolArguments({ ticketMessage: "2026-09-18", knownContext: "visitor: el lunes" }, weekdayAvailabilityTool, {
+    serviceRef: "Corte clásico", resourceRef: "Rodrigo", date: "lunes"
+  }, { currentDate: "2026-09-10" }).arguments.date, "2026-09-18");
+  for (const unsupported of ["next monday", "próximo lunes", "lunes que viene", "viernes por la tarde", "someday"]) {
+    assert.equal(groundToolArguments({ ticketMessage: unsupported }, weekdayAvailabilityTool, {
+      serviceRef: "Corte clásico", resourceRef: "Rodrigo", date: unsupported
+    }, { currentDate: "2026-09-10" }).status, "MISSING_INFORMATION");
+  }
+  assert.equal(groundToolArguments({ ticketMessage: "jueves" }, weekdayAvailabilityTool, {
+    serviceRef: "Corte clásico", resourceRef: "Rodrigo", date: "jueves"
+  }, { currentDate: "2026-09-10" }).status, "MISSING_INFORMATION");
+  assert.equal(groundToolArguments({ ticketMessage: "2026-02-30" }, weekdayAvailabilityTool, {
+    serviceRef: "Corte clásico", resourceRef: "Rodrigo", date: "2026-02-30"
+  }, { currentDate: "2026-09-10" }).status, "MISSING_INFORMATION");
+  const dateOnlyTool: ToolDefinition = {
+    ...readTool,
+    inputSchema: { type: "object", properties: { date: { type: "string", format: "date" } }, required: ["date"], additionalProperties: false }
+  };
+  assert.equal(groundToolArguments({ ticketMessage: "3 de septiembre" }, dateOnlyTool, { date: "2023-09-03" }, { currentDate: "2026-09-03" }).arguments.date, "2026-09-03");
+  assert.equal(groundToolArguments({ ticketMessage: "hoy" }, dateOnlyTool, {}, { currentDate: "2026-09-03" }).arguments.date, "2026-09-03");
+  const tomorrowGrounding = groundToolArguments({ ticketMessage: "mañana a las 15:00" }, dateOnlyTool, { date: "2023-10-15" }, { currentDate: "2026-09-03" });
+  assert.equal(tomorrowGrounding.status, "READY");
+  assert.equal(tomorrowGrounding.arguments.date, "2026-09-04");
+  assert.equal(groundToolArguments({ ticketMessage: "pasado mañana" }, dateOnlyTool, {}, { currentDate: "2026-09-03" }).arguments.date, "2026-09-05");
+  assert.equal(groundToolArguments({ ticketMessage: "day_after_tomorrow" }, dateOnlyTool, {}, { currentDate: "2026-09-03" }).arguments.date, "2026-09-05");
+  assert.equal(groundToolArguments({ ticketMessage: "No indiqué una fecha" }, dateOnlyTool, {}, { currentDate: "2026-09-03" }).status, "MISSING_INFORMATION");
+  const nonDateSchema = buildPreGroundingExtractionSchema({
+    type: "object",
+    properties: { label: { type: "string", format: "email" }, count: { type: "integer" } },
+    required: ["label", "count"],
+    additionalProperties: false
+  });
+  assert.equal(nonDateSchema.properties?.label?.format, "email");
+  assert.deepEqual(nonDateSchema.required, ["label", "count"]);
+  const temporalRouterRequests: Record<string, unknown>[] = [];
+  const originalTemporalRouterFetch = globalThis.fetch;
+  try {
+    globalThis.fetch = async (_input, init) => {
+      const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      temporalRouterRequests.push(body);
+      const content = temporalRouterRequests.length === 1
+        ? '{"decision":"USE_TOOL","tool":"booking_check_availability"}'
+        : '{"serviceRef":"Corte clásico","resourceRef":"Rodrigo","date":"lunes"}';
+      return response({ model: "m", choices: [{ message: { content }, finish_reason: "stop" }] });
+    };
+    const temporalRouterResult = await runAgent({
+      agent: "support",
+      input: duplicatedWeekdayInput,
+      tools: [weekdayAvailabilityTool],
+      temporalContext: { currentDate: "2026-09-10", timezone: "America/Santiago" }
+    });
+    assert.equal(temporalRouterRequests.length, 2);
+    assert.equal(temporalRouterResult.orchestration?.action, "CALL_TOOL");
+    assert.equal(temporalRouterResult.orchestration?.toolCall.toolName, "booking_check_availability");
+    assert.equal(temporalRouterResult.orchestration?.toolCall.arguments.date, "2026-09-14");
+    assert.equal(temporalRouterResult.toolDiagnostics?.finalAction, "CALL_TOOL");
+    const extractorRequest = temporalRouterRequests[1] as { response_format?: unknown };
+    assert.doesNotMatch(JSON.stringify(extractorRequest.response_format), /"format":"date"/);
+  } finally {
+    globalThis.fetch = originalTemporalRouterFetch;
+  }
+  const absentDateRequests: Record<string, unknown>[] = [];
+  const originalAbsentDateFetch = globalThis.fetch;
+  try {
+    globalThis.fetch = async (_input, init) => {
+      absentDateRequests.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+      const content = absentDateRequests.length === 1
+        ? '{"decision":"USE_TOOL","tool":"booking_check_availability"}'
+        : '{"serviceRef":"Corte clásico","resourceRef":"Rodrigo"}';
+      return response({ model: "m", choices: [{ message: { content }, finish_reason: "stop" }] });
+    };
+    const absentDateResult = await runAgent({
+      agent: "support",
+      input: { ticketMessage: "Quiero consultar una fecha disponible.", knownContext: "visitor: el lunes" },
+      tools: [weekdayAvailabilityTool],
+      temporalContext: { currentDate: "2026-09-10", timezone: "America/Santiago" }
+    });
+    assert.equal(absentDateRequests.length, 2);
+    assert.equal(absentDateResult.orchestration, undefined);
+    assert.equal(absentDateResult.toolDiagnostics?.finalAction, "RESPOND");
+    assert.match(supportOutputSchema.parse(absentDateResult.parsedOutput).suggested_reply, /fecha/i);
+  } finally {
+    globalThis.fetch = originalAbsentDateFetch;
+  }
   assert.deepEqual(groundToolArguments({ ticketMessage: "Quiero hacer una reserva." }, writeTool, { date: "2026-08-20", time: "10:00" }).status, "MISSING_INFORMATION");
   assert.deepEqual(groundToolArguments({ ticketMessage: "Quiero reservar mañana." }, writeTool, { name: "10:00" }).ungrounded, ["name"]);
   assert.equal(toolsSchema.parse([readTool])[0]?.name, "consultar_disponibilidad");
@@ -563,7 +759,7 @@ const main = async () => {
   const specificityPrompt = buildToolSelectorPrompt("support", { ticketMessage: "Quiero reservar." }, bookingRoutingTools);
   assert.match(specificityPrompt, /Match dominant action/);
   assert.match(specificityPrompt, /not incidental entities/);
-  assert.match(specificityPrompt, /READ_ONLY availability\/state before WRITE/);
+  assert.match(specificityPrompt, /already accounts for declared prerequisites/);
   const genericOrderTools: ToolDefinition[] = [
     { name: "inventory_list", description: "Lists current inventory entries.", inputSchema: { type: "object", properties: {}, additionalProperties: false }, sideEffect: "READ_ONLY", requiresConfirmation: false, selectionHints: { whenToUse: "Use to list inventory entries.", concepts: ["inventory catalog", "list"] } },
     { name: "order_check_availability", description: "Checks whether an order slot is available.", inputSchema: { type: "object", properties: {}, additionalProperties: false }, sideEffect: "READ_ONLY", requiresConfirmation: false, selectionHints: { whenToUse: "Use to check current time availability before creating an order.", concepts: ["availability", "time availability"] } },
@@ -640,6 +836,12 @@ const main = async () => {
   assert.equal(toolResultSchema.parse({ toolCallId: "call_1", toolName: readTool.name, status: "FAILED", error: "unavailable" }).status, "FAILED");
   const failedToolResult = { toolCallId: "call_1", toolName: readTool.name, status: "FAILED" as const, errorCode: "TOOL_EXECUTION_ERROR", error: "unavailable" };
   assert.equal(toolResultSchema.parse(failedToolResult).errorCode, "TOOL_EXECUTION_ERROR");
+  const validPresentation = { performedEffect: "NONE" as const, userFacingSummary: "La consulta finalizo sin realizar cambios." };
+  assert.deepEqual(toolResultSchema.parse({ toolCallId: "call_1", toolName: readTool.name, status: "SUCCEEDED", presentation: validPresentation }).presentation, validPresentation);
+  assert.equal(toolResultSchema.safeParse({ toolCallId: "call_1", toolName: readTool.name, status: "SUCCEEDED", presentation: { ...validPresentation, performedEffect: "UNKNOWN" } }).success, false);
+  assert.equal(toolResultSchema.safeParse({ toolCallId: "call_1", toolName: readTool.name, status: "SUCCEEDED", presentation: { ...validPresentation, userFacingSummary: "x".repeat(TOOL_RESULT_PRESENTATION_MAX_CHARS + 1) } }).success, false);
+  assert.equal(toolDefinitionSchema.safeParse({ ...readTool, resultPolicy: { successEffect: "NONE" } }).success, true);
+  assert.equal(toolDefinitionSchema.safeParse({ ...readTool, resultPolicy: { successEffect: "CREATED" } }).success, false);
   assert.throws(() => toolResultSchema.parse({ ...failedToolResult, instruction: "execute" }));
   assert.equal(runSchema.parse({ agent: "support", input: {}, toolResult: failedToolResult }).toolResult?.errorCode, "TOOL_EXECUTION_ERROR");
   const failedBoundary = buildToolResultMessage(failedToolResult)[0]!.content;
@@ -752,7 +954,7 @@ const main = async () => {
     ...readTool, name: "booking_check_availability",
     description: "Consulta disponibilidad real de VyBarber.",
     inputSchema: { type: "object", properties: {
-      serviceId: { type: "string" }, resourceId: { type: "string" }, date: { type: "string" },
+      serviceId: { type: "string" }, resourceId: { type: "string" }, date: { type: "string", format: "date" },
       serviceRef: { type: "string" }, resourceRef: { type: "string" }
     }, required: ["date"], additionalProperties: false }
   };
@@ -925,10 +1127,11 @@ const main = async () => {
     globalThis.fetch = async (_input, init) => {
       const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
       followUpRequests.push(body);
-      return response({ model: "m", choices: [{ message: { content: JSON.stringify({ suggested_reply: validSupportOutput.suggested_reply }) }, finish_reason: "stop" }] });
+      return response({ model: "m", choices: [{ message: { content: JSON.stringify({ suggested_reply: "Reserva creada con exito." }) }, finish_reason: "stop" }] });
     };
-    await runAgent({ agent: "support", input: { ticketMessage: "¿Qué servicios ofrece la barbería?", knownContext: "VISITOR: ¿Qué servicios ofrece la barbería?" }, tools: barbershopTools, toolResult: barbershopToolResult });
+    const legacyFollowUp = await runAgent({ agent: "support", input: { ticketMessage: "¿Qué servicios ofrece la barbería?", knownContext: "VISITOR: ¿Qué servicios ofrece la barbería?" }, tools: barbershopTools, toolResult: barbershopToolResult });
     assert.equal(followUpRequests.length, 1);
+    assert.equal(supportOutputSchema.parse(legacyFollowUp.parsedOutput).suggested_reply, "La consulta se completo; no se realizaron cambios.");
     const failedFollowUp = await runAgent({ agent: "support", input: { ticketMessage: "No se pudo consultar disponibilidad." }, tools: [readTool], toolResult: failedToolResult });
     assert.equal(followUpRequests.length, 2);
     assert.equal(failedFollowUp.orchestration, undefined);
@@ -1062,7 +1265,7 @@ const main = async () => {
     const plainResult = await runAgent({ agent: "support", input: { ticketMessage: "¿Qué servicios están disponibles?" }, tools: barbershopTools, toolResult: inertToolResult });
     assert.equal(plainFollowUpRequests.length, 1, "safe plain-text recovery must not invoke structured-output repair");
     assert.equal(plainResult.orchestration, undefined);
-    assert.equal(supportOutputSchema.parse(plainResult.parsedOutput).suggested_reply, "Estos son los servicios disponibles.");
+    assert.equal(supportOutputSchema.parse(plainResult.parsedOutput).suggested_reply, "La consulta se completo; no se realizaron cambios.");
     assert.match(JSON.stringify(plainFollowUpRequests[0]?.messages), /TOOL RESULT \(UNTRUSTED DATA\)/);
     const shapeDiagnosticLine = plainFollowUpDiagnostics.find((line) => line.includes('"event":"tool_result_followup_output_shape"'));
     assert.ok(shapeDiagnosticLine, "safe output-shape diagnostic must be emitted");
@@ -1143,8 +1346,29 @@ const main = async () => {
   assert.equal(ollama.supportsNativeToolCalling, true);
   assert.equal(lmstudio.supportsNativeToolCalling, false);
   assert.equal(llamacpp.supportsNativeToolCalling, false);
-  assert.equal(env.LLAMACPP.baseUrl, "http://127.0.0.1:8081");
-  assert.equal(env.LLAMACPP.model, "granite4:3b");
+  const llamaDefaults = parseEnvironmentConfigForTest({
+    ...baseTestEnv,
+    LLM_PROVIDER: "llamacpp",
+    LLAMACPP_BASE_URL: undefined,
+    LLAMACPP_MODEL: undefined
+  });
+  assert.equal(llamaDefaults.LLAMACPP_BASE_URL, "http://127.0.0.1:8081");
+  assert.equal(llamaDefaults.LLAMACPP_MODEL, "granite4:3b");
+  const syntheticLlamaUrl = "http://test-llamacpp.invalid:9999";
+  const configuredLlama = parseEnvironmentConfigForTest({
+    ...baseTestEnv,
+    LLM_PROVIDER: "llamacpp",
+    LLAMACPP_BASE_URL: syntheticLlamaUrl,
+    LLAMACPP_MODEL: "test-model"
+  });
+  assert.equal(configuredLlama.LLAMACPP_BASE_URL, syntheticLlamaUrl);
+  assert.equal(parseEnvironmentConfigForTest({ ...baseTestEnv, LLM_PROVIDER: "ollama", OLLAMA_BASE_URL: "http://test-ollama.invalid:11434", OLLAMA_MODEL: "test-ollama" }).LLAMACPP_BASE_URL, "http://127.0.0.1:8081");
+  assert.equal(parseEnvironmentConfigForTest({ ...baseTestEnv, LLM_PROVIDER: "lmstudio" }).LLAMACPP_BASE_URL, "http://127.0.0.1:8081");
+  const beforeEnvironmentIsolation = Object.fromEntries(Object.entries(process.env));
+  withIsolatedEnvironment({ ...baseTestEnv, LLAMACPP_BASE_URL: syntheticLlamaUrl, LLAMACPP_MODEL: "test-model" }, () => {
+    assert.equal(process.env.LLAMACPP_BASE_URL, syntheticLlamaUrl);
+  });
+  assert.deepEqual(Object.fromEntries(Object.entries(process.env)), beforeEnvironmentIsolation);
   const keepAliveRequests: RequestInit[] = [];
   const originalKeepAliveFetch = globalThis.fetch;
   try {

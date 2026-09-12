@@ -105,6 +105,25 @@ export const buildExtractionSchema = (inputSchema: ToolDefinition["inputSchema"]
   return { ...inputSchema, properties, required: [...required], additionalProperties: false };
 };
 
+// Date expressions are canonicalized deterministically from the current turn
+// before the original tool schema performs its final strict ISO validation.
+export const buildPreGroundingExtractionSchema = (inputSchema: ToolDefinition["inputSchema"]): ToolDefinition["inputSchema"] => {
+  const extractionSchema = buildExtractionSchema(inputSchema);
+  const properties = Object.fromEntries(Object.entries(extractionSchema.properties ?? {}).map(([name, property]) => [
+    name,
+    property.format === "date" ? { ...property, format: undefined } : property
+  ]));
+  const temporalFields = new Set(Object.entries(extractionSchema.properties ?? {})
+    .filter(([, property]) => property.format === "date")
+    .map(([name]) => name));
+  return {
+    ...extractionSchema,
+    properties,
+    required: (extractionSchema.required ?? []).filter((name) => !temporalFields.has(name)),
+    additionalProperties: false
+  };
+};
+
 export const buildCompactExtractionDescriptor = (inputSchema: ToolDefinition["inputSchema"]): CompactExtractionDescriptor => {
   const root = inputSchema as SchemaLike;
   const properties = isRecord(root.properties) ? root.properties : {};
@@ -133,8 +152,9 @@ export const buildCompactExtractionDescriptor = (inputSchema: ToolDefinition["in
 export const extractToolArguments = async (params: { input: unknown; tool: ToolDefinition; correlationId?: string; currentDate?: string }): Promise<ToolArgumentExtractionResult> => {
   const startedAt = Date.now();
   const schema = z.record(z.string(), z.unknown());
-  const extractionTool = { ...params.tool, inputSchema: buildExtractionSchema(params.tool.inputSchema) };
-  const compactDescriptor = buildCompactExtractionDescriptor(extractionTool.inputSchema);
+  const extractionSchema = buildExtractionSchema(params.tool.inputSchema);
+  const extractionTool = { ...params.tool, inputSchema: buildPreGroundingExtractionSchema(params.tool.inputSchema) };
+  const compactDescriptor = buildCompactExtractionDescriptor(extractionSchema);
   try {
     const execution = await executeStructuredOutput({
       baseMessages: [{ role: "system", content: [
