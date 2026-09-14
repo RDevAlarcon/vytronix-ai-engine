@@ -1,5 +1,11 @@
 # vytronix-ai-engine
 
+## Engineering Memory
+
+Este repositorio es Vytronix AI Engine. Antes de cambios, diagnósticos u operaciones de ingeniería significativas, consulta `C:\Proyectos\vytronix-engineering-memory\skills\vytronix-engineering\SKILL.md` y busca los incidentes, patrones, runbooks y decisiones relevantes. Para trabajo HIGH-risk, consulta el runbook aplicable antes de ejecutar y reporta los IDs de memoria y los límites de seguridad cuando resulte práctico.
+
+Valida la memoria contra el source, tests, configuración, evidencia runtime y requisitos explícitos actuales; la evidencia actual prevalece cuando la memoria está obsoleta. La similitud histórica es sólo una hipótesis: nunca apliques mecánicamente un fix anterior. Engineering Memory es la fuente canónica externa: no la modifiques automáticamente; sus actualizaciones son tareas separadas, explícitas y respaldadas por evidencia.
+
 La v1.2 añade structured tool calling opcional: el Engine decide y valida una solicitud, pero nunca ejecuta herramientas. Consulta [tool-calling-contract-v1-2.md](docs/tool-calling-contract-v1-2.md) y [tool-calling-security.md](docs/tool-calling-security.md).
 
 > Vytronix AI Engine v1 — frozen baseline. Current benchmark candidate: Ollama + `phi4-mini`. Provider and model remain configurable.
