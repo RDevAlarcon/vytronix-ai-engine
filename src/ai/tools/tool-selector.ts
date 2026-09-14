@@ -103,7 +103,18 @@ type DynamicSemanticGroup = {
 const DYNAMIC_SEMANTIC_GROUPS: DynamicSemanticGroup[] = [
   { action: "CANCEL", requestSignals: ["cancelar", "anular", "cancel ", "cancellation"], capabilitySignalTiers: [["cancel", "cancelar", "anular"]] },
   { requestSignals: ["que servicios", "mostrar servicios", "muestrame los servicios", "what services", "list services", "show services", "available services", "service catalog"], capabilitySignalTiers: [["list", "listar", "catalog", "catalogo", "offerings", "available services"]] },
-  { requestSignals: ["precio", "costo", "cuanto cuesta", "tarifa", "price", "cost", "fee"], capabilitySignalTiers: [["precio", "costo", "tarifa", "price", "cost", "fee"]] },
+  {
+    requestSignals: ["precio", "costo", "cuanto cuesta", "tarifa", "price", "cost", "fee"],
+    // The input is accent-normalized first. Keep "vale" phrase-bound and
+    // "valor" query-shaped so acknowledgements, inflections, and general prose
+    // do not route as price.
+    requestPatterns: [
+      /\bcuanto\s+vale\b/u,
+      /\bcual\s+es\s+el\s+valor\b/u,
+      /^[¿?¡!\s]*valor(?:[¿?¡!.\s]*$|\s+(?:del|de(?:\s+(?:la|los|las))?)\b)/u
+    ],
+    capabilitySignalTiers: [["precio", "costo", "tarifa", "price", "cost", "fee"]]
+  },
   {
     kind: "AVAILABILITY",
     requestSignals: ["disponibilidad", "disponible", "availability", "slot", "cupo", "hay hora", "horario"],

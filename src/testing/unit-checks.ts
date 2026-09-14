@@ -785,6 +785,18 @@ const main = async () => {
   expectedRoutingPolicy("Quiero reservar un Corte clásico con Rodrigo el 10 de septiembre a las 14:30.", "booking_check_availability");
   expectedRoutingPolicy("¿Qué servicios tienen?", "service_list");
   expectedRoutingPolicy("¿Cuánto cuesta el Corte clásico?", "service_get_price");
+  for (const priceRequest of [
+    "cuanto vale un corte clasico",
+    "¿cuánto vale el corte clásico?",
+    "valor",
+    "valor del corte clasico",
+    "cual es el valor del corte clasico",
+    "¿cuál es el valor del corte clásico?",
+    "What is the price of the classic haircut?"
+  ]) expectedRoutingPolicy(priceRequest, "service_get_price");
+  for (const nonPriceRequest of ["vale, gracias", "ok vale", "valoramos mucho el servicio", "hablemos del valor de la amistad", "gracias por la ayuda"]) {
+    assert.deepEqual(resolveToolSelectionPolicy({ ticketMessage: nonPriceRequest }, bookingRoutingTools), { mustUseTool: false, compatibleToolNames: [] });
+  }
   expectedRoutingPolicy("¿Hay hora con Rodrigo mañana a las 15:00?", "booking_check_availability");
   expectedRoutingPolicy("Quiero cancelar mi reserva.", "booking_cancel");
   expectedRoutingPolicy("Quiero ver mi reserva.", "booking_get");
@@ -794,6 +806,33 @@ const main = async () => {
   expectedRoutingPolicy("Hola, quiero reservar un servicio para mañana.", "booking_check_availability");
   expectedRoutingPolicy("Muéstrame los servicios para poder decidir qué reservar", "service_list");
   expectedRoutingPolicy("¿Qué servicios tienen y cuánto cuestan?", "service_list");
+  const priceReferenceTool: ToolDefinition = {
+    ...bookingRoutingTools[1]!,
+    inputSchema: {
+      type: "object",
+      properties: { serviceId: { type: "string" }, serviceRef: { type: "string" } },
+      required: ["serviceId"],
+      additionalProperties: false
+    }
+  };
+  assert.deepEqual(Object.keys(buildExtractionSchema(priceReferenceTool.inputSchema).properties!), ["serviceRef"]);
+  const priceExtractionRequests: Record<string, unknown>[] = [];
+  const originalPriceExtractionFetch = globalThis.fetch;
+  try {
+    globalThis.fetch = async (_input, init) => {
+      priceExtractionRequests.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+      return response({ model: "m", choices: [{ message: { content: '{"serviceRef":"corte clasico"}' }, finish_reason: "stop" }] });
+    };
+    const priceExtraction = await extractToolArguments({ input: { ticketMessage: "cuanto vale un corte clasico" }, tool: priceReferenceTool });
+    assert.equal(priceExtraction.status, "SUCCESS");
+    assert.deepEqual(priceExtraction.arguments, { serviceRef: "corte clasico" });
+    const priceExtractionText = (priceExtractionRequests[0]?.messages as Array<{ content: string }>).map((message) => message.content).join("\n");
+    assert.match(priceExtractionText, /cuanto vale un corte clasico/);
+    assert.equal(JSON.stringify(priceExtractionRequests[0]?.response_format).includes("serviceRef"), true);
+    assert.equal(JSON.stringify(priceExtractionRequests[0]?.response_format).includes("serviceId"), false);
+  } finally {
+    globalThis.fetch = originalPriceExtractionFetch;
+  }
   const explicitBookingPolicy = resolveToolSelectionPolicy({ ticketMessage: "Quiero reservar un servicio con un recurso en una fecha y hora." }, bookingRoutingTools);
   const explicitBookingSchema = buildToolSelectionResponseSchema(bookingRoutingTools, explicitBookingPolicy);
   assert.deepEqual(explicitBookingSchema.properties.tool?.enum, ["booking_check_availability"]);
