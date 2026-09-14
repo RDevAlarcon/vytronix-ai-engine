@@ -69,10 +69,42 @@ const FAST_ENABLED_AGENTS = new Set<AgentName>(["lead"]);
 export const TOOL_RESULT_FOLLOW_UP_MAX_TOKENS = 120;
 export const TOOL_RESULT_FOLLOW_UP_MAX_REPLY_CHARS = 200;
 
-const isPureGreeting = (value: unknown): boolean => {
-  if (typeof value !== "string") return false;
-  const normalized = value.trim().toLocaleLowerCase().replace(/[!?.,;:]+$/g, "").replace(/\s+/g, " ");
-  return ["hola", "holi", "buenas", "buenos días", "buenas tardes", "buenas noches", "hey", "hello", "hi"].includes(normalized);
+type DeterministicGreeting = { summary: string; reply: string };
+
+const SPANISH_GREETING: DeterministicGreeting = {
+  summary: "Saludo inicial.",
+  reply: "¡Hola! ¿En qué puedo ayudarte hoy?"
+};
+const ENGLISH_GREETING: DeterministicGreeting = {
+  summary: "Initial greeting.",
+  reply: "Hello! How can I assist you today?"
+};
+const DETERMINISTIC_GREETINGS: Readonly<Record<string, DeterministicGreeting>> = {
+  hola: SPANISH_GREETING,
+  holi: SPANISH_GREETING,
+  buenas: SPANISH_GREETING,
+  "buenos dias": SPANISH_GREETING,
+  "buenas tardes": SPANISH_GREETING,
+  "buenas noches": SPANISH_GREETING,
+  hello: ENGLISH_GREETING,
+  hi: ENGLISH_GREETING,
+  hey: ENGLISH_GREETING,
+  "good morning": ENGLISH_GREETING,
+  "good afternoon": ENGLISH_GREETING,
+  "good evening": ENGLISH_GREETING
+};
+
+const resolveDeterministicGreeting = (value: unknown): DeterministicGreeting | undefined => {
+  if (typeof value !== "string") return undefined;
+  const normalized = value
+    .normalize("NFD")
+    .replace(/\p{M}+/gu, "")
+    .toLocaleLowerCase()
+    .trim()
+    .replace(/^[¡!¿?]+|[!?.,;:¡¿]+$/gu, "")
+    .replace(/\s+/gu, " ")
+    .trim();
+  return DETERMINISTIC_GREETINGS[normalized];
 };
 
 const resolveMaxTokens = (
@@ -391,9 +423,11 @@ export const runAgent = async (request: AgentRunRequest): Promise<AgentRunResult
     parsedRequest.mode === "fast" && FAST_ENABLED_AGENTS.has(parsedRequest.agent) ? "fast" : "standard";
 
   const rawInput = parsedRequest.input as Record<string, unknown>;
-  const greeting = parsedRequest.agent === "support" && !parsedRequest.ragContext && !parsedRequest.toolResult && isPureGreeting(rawInput?.ticketMessage);
+  const greeting = parsedRequest.agent === "support" && !parsedRequest.toolResult
+    ? resolveDeterministicGreeting(rawInput?.ticketMessage)
+    : undefined;
   if (greeting) {
-    const output = agentDefinition.outputSchema.parse({ category: "general", priority: "low", summary: "Saludo inicial.", suggested_reply: "Hola, ¿en qué puedo ayudarte?", escalate_to_human: false, is_in_scope: true, out_of_scope_reason: null, safe_reply: "Hola, ¿en qué puedo ayudarte?" });
+    const output = agentDefinition.outputSchema.parse({ category: "general", priority: "low", summary: greeting.summary, suggested_reply: greeting.reply, escalate_to_human: false, is_in_scope: true, out_of_scope_reason: null, safe_reply: greeting.reply });
     return { agent: parsedRequest.agent, mode: effectiveMode, parsedOutput: output, rawOutput: JSON.stringify(output), model: "deterministic-greeting", provider: "internal", attemptCount: 0, durationMs: 0, responseAuthority: informationalResponseAuthority() };
   }
 

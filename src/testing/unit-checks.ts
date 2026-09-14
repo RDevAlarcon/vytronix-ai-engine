@@ -132,21 +132,57 @@ const main = async () => {
   assert.equal(limiter.consume("client", 2), false);
   assert.equal(limiter.consume("client", 1001), true);
 
-  const greeting = await runAgent({ agent: "support", input: { ticketMessage: "Hola" } });
-  const greetingOutput = greeting.parsedOutput as Record<string, unknown>;
-  assert.equal(greeting.provider, "internal");
-  assert.equal(greeting.model, "deterministic-greeting");
-  assert.equal(greetingOutput.category, "general");
-  assert.equal(greetingOutput.priority, "low");
-  assert.equal(greetingOutput.is_in_scope, true);
-  assert.equal(greetingOutput.out_of_scope_reason, null);
-  assert.equal(typeof greetingOutput.summary, "string");
-  assert.equal(typeof greetingOutput.suggested_reply, "string");
-  assert.equal(typeof greetingOutput.escalate_to_human, "boolean");
-  assert.equal(typeof greetingOutput.safe_reply, "string");
-
   const originalAgentFetch = globalThis.fetch;
   try {
+    let deterministicGreetingFetchCount = 0;
+    globalThis.fetch = async () => {
+      deterministicGreetingFetchCount += 1;
+      throw new Error("deterministic greeting must not call the provider");
+    };
+
+    const assertDeterministicGreeting = async (
+      ticketMessage: string,
+      expectedReply: string,
+      input: Record<string, unknown> = {}
+    ) => {
+      const result = await runAgent({
+        agent: "support",
+        input: { ticketMessage, ...input }
+      });
+      const output = result.parsedOutput as Record<string, unknown>;
+      assert.equal(result.provider, "internal");
+      assert.equal(result.model, "deterministic-greeting");
+      assert.equal(result.attemptCount, 0);
+      assert.equal(output.category, "general");
+      assert.equal(output.priority, "low");
+      assert.equal(output.is_in_scope, true);
+      assert.equal(output.out_of_scope_reason, null);
+      assert.equal(output.suggested_reply, expectedReply);
+      assert.equal(output.safe_reply, expectedReply);
+      assert.equal(typeof output.summary, "string");
+      assert.equal(typeof output.escalate_to_human, "boolean");
+    };
+
+    const spanishGreeting = "¡Hola! ¿En qué puedo ayudarte hoy?";
+    for (const ticketMessage of ["hola", "buenos días", "buenas tardes", "buenas noches"]) {
+      await assertDeterministicGreeting(ticketMessage, spanishGreeting);
+    }
+    const englishGreeting = "Hello! How can I assist you today?";
+    for (const ticketMessage of ["hello", "hi", "hey", "good morning", "good afternoon", "good evening"]) {
+      await assertDeterministicGreeting(ticketMessage, englishGreeting);
+    }
+    await assertDeterministicGreeting("hola", spanishGreeting, { knownContext: "visitor: hello" });
+    await assertDeterministicGreeting("hello", englishGreeting, { knownContext: "visitor: hola" });
+
+    const greetingWithRag = await runAgent({
+      agent: "support",
+      input: { ticketMessage: "hola" },
+      ragContext: { items: [{ content: "Referencia sintética.", sourceId: "fixture", score: 1 }] }
+    });
+    assert.equal(greetingWithRag.model, "deterministic-greeting");
+    assert.equal((greetingWithRag.parsedOutput as Record<string, unknown>).suggested_reply, spanishGreeting);
+    assert.equal(deterministicGreetingFetchCount, 0);
+
     globalThis.fetch = async (_input, init) => {
       const body = JSON.parse(String(init?.body)) as { response_format?: { json_schema?: { schema?: { properties?: Record<string, unknown> } } } };
       const properties = Object.keys(body.response_format?.json_schema?.schema?.properties ?? {});
@@ -158,6 +194,10 @@ const main = async () => {
     const nonGreeting = await runAgent({ agent: "support", input: { ticketMessage: "Necesito orientación general sobre cómo solicitar ayuda." } });
     assert.notEqual(nonGreeting.model, "deterministic-greeting");
     assert.notEqual(nonGreeting.provider, "internal");
+
+    const ambiguousGreeting = await runAgent({ agent: "support", input: { ticketMessage: "hola, can you help me?" } });
+    assert.notEqual(ambiguousGreeting.model, "deterministic-greeting");
+    assert.notEqual(ambiguousGreeting.provider, "internal");
 
     const withRag = await runAgent({ agent: "support", input: { ticketMessage: "Hola, necesito información adicional." }, ragContext: { items: [{ content: "Referencia sintética.", sourceId: "fixture", score: 1 }] } });
     assert.notEqual(withRag.model, "deterministic-greeting");
@@ -751,6 +791,7 @@ const main = async () => {
   assert.deepEqual(resolveToolSelectionPolicy({ ticketMessage: "Hola" }, bookingRoutingTools), { mustUseTool: false, compatibleToolNames: [] });
   expectedRoutingPolicy("Necesito una hora", "booking_check_availability");
   expectedRoutingPolicy("Quiero reservar", "booking_check_availability");
+  expectedRoutingPolicy("Hola, quiero reservar un servicio para mañana.", "booking_check_availability");
   expectedRoutingPolicy("Muéstrame los servicios para poder decidir qué reservar", "service_list");
   expectedRoutingPolicy("¿Qué servicios tienen y cuánto cuestan?", "service_list");
   const explicitBookingPolicy = resolveToolSelectionPolicy({ ticketMessage: "Quiero reservar un servicio con un recurso en una fecha y hora." }, bookingRoutingTools);
