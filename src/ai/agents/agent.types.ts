@@ -4,6 +4,7 @@ import type { StructuredOutputDiagnostic } from "@/ai/structured-output/structur
 import type { RagContext } from "@/ai/rag/rag-context";
 import type { ToolDefinition, ToolEffect, ToolProgressionEvidence, ToolResult } from "@/ai/tools/tool-contract";
 import type { TemporalContext } from "@/ai/tools/tool-temporal-context";
+import type { ResponseLanguage } from "@/ai/agents/response-language";
 
 export type AgentName = "lead" | "landing" | "proposal" | "support";
 export type AgentExecutionMode = "standard" | "fast";
@@ -37,6 +38,7 @@ export type AgentRunRequest = {
   agent: AgentName;
   input: unknown;
   mode?: AgentExecutionMode;
+  responseLanguage?: ResponseLanguage;
   ragContext?: RagContext;
   tools?: ToolDefinition[];
   toolResult?: ToolResult;

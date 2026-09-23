@@ -64,7 +64,7 @@ export const proposalOutputSchema = z.object({
 });
 
 export const supportInputSchema = z.object({
-  ticketMessage: z.string().min(10).max(4000),
+  ticketMessage: z.string().min(1).max(4000).refine((value) => value.trim().length > 0, "ticketMessage must not be blank"),
   customerName: z.string().max(300).optional(),
   accountType: z.string().max(100).optional(),
   productArea: z.string().max(300).optional(),

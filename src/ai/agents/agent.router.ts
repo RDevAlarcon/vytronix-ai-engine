@@ -15,6 +15,7 @@ import { classifyAgentScope } from "@/ai/agents/intent.classifier";
 import { llmService } from "@/ai/llm/llm.service";
 import { AppError } from "@/lib/errors";
 import { executeStructuredOutput } from "@/ai/structured-output/structured-output";
+import { applyResponseLanguageDirective, responseLanguageSchema } from "@/ai/agents/response-language";
 import { buildRetrievedKnowledgeMessage, ragContextSchema } from "@/ai/rag/rag-context";
 import { buildSelectionDirective, resolveCurrentMutationIntent, selectTool } from "@/ai/tools/tool-selector";
 import { resolveToolRoutingStrategy } from "@/ai/tools/tool-routing";
@@ -49,6 +50,7 @@ const runRequestSchema = z.object({
   agent: z.enum(["lead", "landing", "proposal", "support"]),
   input: z.unknown(),
   mode: z.enum(["standard", "fast"]).default("standard"),
+  responseLanguage: responseLanguageSchema.default("und"),
   ragContext: ragContextSchema.optional(),
   tools: toolsSchema.optional(),
   toolResult: toolResultSchema.optional(),
@@ -69,17 +71,33 @@ const FAST_ENABLED_AGENTS = new Set<AgentName>(["lead"]);
 export const TOOL_RESULT_FOLLOW_UP_MAX_TOKENS = 120;
 export const TOOL_RESULT_FOLLOW_UP_MAX_REPLY_CHARS = 200;
 
-type DeterministicGreeting = { summary: string; reply: string };
+type DeterministicSocialResponse = {
+  summary: string;
+  reply: string;
+  model: "deterministic-greeting" | "deterministic-acknowledgement";
+};
 
-const SPANISH_GREETING: DeterministicGreeting = {
+const SPANISH_GREETING: DeterministicSocialResponse = {
   summary: "Saludo inicial.",
-  reply: "¡Hola! ¿En qué puedo ayudarte hoy?"
+  reply: "¡Hola! ¿En qué puedo ayudarte hoy?",
+  model: "deterministic-greeting"
 };
-const ENGLISH_GREETING: DeterministicGreeting = {
+const ENGLISH_GREETING: DeterministicSocialResponse = {
   summary: "Initial greeting.",
-  reply: "Hello! How can I assist you today?"
+  reply: "Hello! How can I assist you today?",
+  model: "deterministic-greeting"
 };
-const DETERMINISTIC_GREETINGS: Readonly<Record<string, DeterministicGreeting>> = {
+const SPANISH_ACKNOWLEDGEMENT: DeterministicSocialResponse = {
+  summary: "Agradecimiento recibido.",
+  reply: "¡De nada!",
+  model: "deterministic-acknowledgement"
+};
+const ENGLISH_ACKNOWLEDGEMENT: DeterministicSocialResponse = {
+  summary: "Acknowledgement received.",
+  reply: "You're welcome!",
+  model: "deterministic-acknowledgement"
+};
+const DETERMINISTIC_GREETINGS: Readonly<Record<string, DeterministicSocialResponse>> = {
   hola: SPANISH_GREETING,
   holi: SPANISH_GREETING,
   buenas: SPANISH_GREETING,
@@ -93,10 +111,16 @@ const DETERMINISTIC_GREETINGS: Readonly<Record<string, DeterministicGreeting>> =
   "good afternoon": ENGLISH_GREETING,
   "good evening": ENGLISH_GREETING
 };
+const DETERMINISTIC_ACKNOWLEDGEMENTS: Readonly<Record<string, DeterministicSocialResponse>> = {
+  gracias: SPANISH_ACKNOWLEDGEMENT,
+  "muchas gracias": SPANISH_ACKNOWLEDGEMENT,
+  thanks: ENGLISH_ACKNOWLEDGEMENT,
+  "thank you": ENGLISH_ACKNOWLEDGEMENT
+};
 
-const resolveDeterministicGreeting = (value: unknown): DeterministicGreeting | undefined => {
+const normalizeDeterministicSocialText = (value: unknown): string | undefined => {
   if (typeof value !== "string") return undefined;
-  const normalized = value
+  return value
     .normalize("NFD")
     .replace(/\p{M}+/gu, "")
     .toLocaleLowerCase()
@@ -104,7 +128,12 @@ const resolveDeterministicGreeting = (value: unknown): DeterministicGreeting | u
     .replace(/^[¡!¿?]+|[!?.,;:¡¿]+$/gu, "")
     .replace(/\s+/gu, " ")
     .trim();
-  return DETERMINISTIC_GREETINGS[normalized];
+};
+
+const resolveDeterministicSocialResponse = (value: unknown): DeterministicSocialResponse | undefined => {
+  const normalized = normalizeDeterministicSocialText(value);
+  if (!normalized) return undefined;
+  return DETERMINISTIC_GREETINGS[normalized] ?? DETERMINISTIC_ACKNOWLEDGEMENTS[normalized];
 };
 
 const resolveMaxTokens = (
@@ -423,12 +452,12 @@ export const runAgent = async (request: AgentRunRequest): Promise<AgentRunResult
     parsedRequest.mode === "fast" && FAST_ENABLED_AGENTS.has(parsedRequest.agent) ? "fast" : "standard";
 
   const rawInput = parsedRequest.input as Record<string, unknown>;
-  const greeting = parsedRequest.agent === "support" && !parsedRequest.toolResult
-    ? resolveDeterministicGreeting(rawInput?.ticketMessage)
+  const deterministicSocialResponse = parsedRequest.agent === "support" && !parsedRequest.toolResult
+    ? resolveDeterministicSocialResponse(rawInput?.ticketMessage)
     : undefined;
-  if (greeting) {
-    const output = agentDefinition.outputSchema.parse({ category: "general", priority: "low", summary: greeting.summary, suggested_reply: greeting.reply, escalate_to_human: false, is_in_scope: true, out_of_scope_reason: null, safe_reply: greeting.reply });
-    return { agent: parsedRequest.agent, mode: effectiveMode, parsedOutput: output, rawOutput: JSON.stringify(output), model: "deterministic-greeting", provider: "internal", attemptCount: 0, durationMs: 0, responseAuthority: informationalResponseAuthority() };
+  if (deterministicSocialResponse) {
+    const output = agentDefinition.outputSchema.parse({ category: "general", priority: "low", summary: deterministicSocialResponse.summary, suggested_reply: deterministicSocialResponse.reply, escalate_to_human: false, is_in_scope: true, out_of_scope_reason: null, safe_reply: deterministicSocialResponse.reply });
+    return { agent: parsedRequest.agent, mode: effectiveMode, parsedOutput: output, rawOutput: JSON.stringify(output), model: deterministicSocialResponse.model, provider: "internal", attemptCount: 0, durationMs: 0, responseAuthority: informationalResponseAuthority() };
   }
 
   const parsedInput = agentDefinition.inputSchema.safeParse(parsedRequest.input);
@@ -632,7 +661,7 @@ export const runAgent = async (request: AgentRunRequest): Promise<AgentRunResult
   const supportToolResultFollowUp = parsedRequest.agent === "support" && Boolean(parsedRequest.toolResult);
   const noToolNormalResponse = !nativeToolCalling && !parsedRequest.toolResult && enforcedToolSelection?.decision.decision === "NO_TOOL";
   const toolResultFollowUpPromptSchema = supportToolResultFollowUp ? z.toJSONSchema(supportToolResultFollowUpSchema) : z.toJSONSchema(agentDefinition.outputSchema);
-  const messagesWithKnowledge = [
+  const messagesWithKnowledge = applyResponseLanguageDirective([
     ...(noToolNormalResponse
       ? baseMessages.map((message) => message.role === "system"
         ? {
@@ -656,7 +685,7 @@ export const runAgent = async (request: AgentRunRequest): Promise<AgentRunResult
     ...buildRetrievedKnowledgeMessage(parsedRequest.ragContext),
     ...(!parsedRequest.toolResult && !noToolNormalResponse ? buildToolContext(availableTools) : []),
     ...(parsedRequest.toolResult ? buildToolResultMessage(parsedRequest.toolResult) : [])
-  ];
+  ], parsedRequest.responseLanguage);
   const outputSchema = domainOnlyResponse
     ? supportToolResultFollowUp ? supportToolResultFollowUpSchema : agentDefinition.outputSchema
     : usesToolContract
@@ -701,10 +730,10 @@ export const runAgent = async (request: AgentRunRequest): Promise<AgentRunResult
           // The native request decides only whether a tool was requested. Once
           // it decides NO_TOOL, domain generation must use the legacy domain
           // prompt and must not inherit orchestration/tool instructions.
-          messages: [
+          messages: applyResponseLanguageDirective([
             ...baseMessages,
             ...buildRetrievedKnowledgeMessage(parsedRequest.ragContext)
-          ],
+          ], parsedRequest.responseLanguage),
           temperature,
           maxTokens,
           responseSchema: z.toJSONSchema(agentDefinition.outputSchema),

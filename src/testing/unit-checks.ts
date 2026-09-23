@@ -1,5 +1,7 @@
 import "dotenv/config";
 import { runToolDateDiagnosticChecks } from "./tool-date-diagnostic-checks";
+import { runToolArgumentGroundingChecks } from "./tool-argument-grounding-checks";
+import { runSupportConversationChecks } from "./support-conversation-checks";
 import { runToolProgressionChecks } from "./tool-progression-checks";
 import { runToolResultGroundingChecks } from "./tool-result-grounding-checks";
 import assert from "node:assert/strict";
@@ -28,6 +30,7 @@ import { resolveToolRoutingStrategy } from "@/ai/tools/tool-routing";
 import { currentTurnText, groundToolArguments, normalizeRelativeDate } from "@/ai/tools/tool-argument-grounding";
 import { buildRetrievedKnowledgeMessage, ragContextSchema, RAG_MAX_ITEM_CHARS, RAG_MAX_ITEMS, RAG_MAX_TOTAL_CHARS } from "@/ai/rag/rag-context";
 import { assembleSupportToolResultOutput, humanizeToolArgumentName, inspectSupportToolResultFollowUpShape, normalizeSupportToolResultFollowUpContent, resolveToolArgumentLabel, resolveToolResultFollowUpMaxTokens, runAgent, supportToolResultFollowUpSchema, TOOL_RESULT_FOLLOW_UP_MAX_REPLY_CHARS } from "@/ai/agents/agent.router";
+import { applyResponseLanguageDirective, buildResponseLanguageDirective, responseLanguageSchema } from "@/ai/agents/response-language";
 import { estimateTextTokens } from "@/ai/runtime/inference-input-limits";
 import { assembleToolCall, buildToolAwareSchema, buildToolAwareSystemPrompt, buildToolContext, buildToolOrchestrationInstructions, buildToolResultFollowUpSystemPrompt, buildToolResultMessage, toolDefinitionSchema, toolResultSchema, toolsSchema, validateToolCall, TOOL_PROGRESSION_EVIDENCE_MAX_COUNT, TOOL_RESULT_PRESENTATION_MAX_CHARS, type ToolDefinition, type ToolResult } from "@/ai/tools/tool-contract";
 
@@ -88,6 +91,8 @@ const runProviderContract = async (provider: LlmProvider): Promise<void> => {
 
 const main = async () => {
   await runToolDateDiagnosticChecks();
+  runToolArgumentGroundingChecks();
+  await runSupportConversationChecks();
   await runToolProgressionChecks();
   await runToolContinuationChecks();
   await runToolResultGroundingChecks();
@@ -174,6 +179,50 @@ const main = async () => {
     await assertDeterministicGreeting("hola", spanishGreeting, { knownContext: "visitor: hello" });
     await assertDeterministicGreeting("hello", englishGreeting, { knownContext: "visitor: hola" });
 
+    const assertDeterministicAcknowledgement = async (
+      ticketMessage: string,
+      expectedReply: string,
+      responseLanguage?: "es" | "en",
+      knownContext?: string
+    ) => {
+      const result = await runAgent({
+        agent: "support",
+        input: { ticketMessage, ...(knownContext ? { knownContext } : {}) },
+        tools: [{ name: "service_list", description: "List services.", inputSchema: { type: "object", properties: {}, additionalProperties: false }, sideEffect: "READ_ONLY", requiresConfirmation: false }],
+        ...(responseLanguage ? { responseLanguage } : {})
+      });
+      const output = supportOutputSchema.parse(result.parsedOutput);
+      assert.equal(result.provider, "internal");
+      assert.equal(result.model, "deterministic-acknowledgement");
+      assert.equal(result.attemptCount, 0);
+      assert.deepEqual(result.responseAuthority, { kind: "INFORMATIONAL", performedEffect: "NONE" });
+      assert.deepEqual(Object.keys(output).sort(), [
+        "category",
+        "escalate_to_human",
+        "is_in_scope",
+        "out_of_scope_reason",
+        "priority",
+        "safe_reply",
+        "suggested_reply",
+        "summary"
+      ]);
+      assert.equal(output.category, "general");
+      assert.equal(output.priority, "low");
+      assert.equal(output.escalate_to_human, false);
+      assert.equal(output.is_in_scope, true);
+      assert.equal(output.out_of_scope_reason, null);
+      assert.equal(output.suggested_reply, expectedReply);
+      assert.equal(output.safe_reply, expectedReply);
+    };
+
+    for (const ticketMessage of ["gracias", "muchas gracias", "Gracias!", "  muchas gracias  "]) {
+      await assertDeterministicAcknowledgement(ticketMessage, "¡De nada!", "en", "visitor: thank you");
+    }
+    for (const ticketMessage of ["thanks", "thank you", "THANKS!", "Thank you."]) {
+      await assertDeterministicAcknowledgement(ticketMessage, "You're welcome!", "es", "visitor: muchas gracias");
+    }
+    assert.equal(deterministicGreetingFetchCount, 0);
+
     const greetingWithRag = await runAgent({
       agent: "support",
       input: { ticketMessage: "hola" },
@@ -199,16 +248,58 @@ const main = async () => {
     assert.notEqual(ambiguousGreeting.model, "deterministic-greeting");
     assert.notEqual(ambiguousGreeting.provider, "internal");
 
+    for (const ticketMessage of ["gracias quiero reservar", "gracias, necesito una hora", "thanks book me tomorrow", "muchas gracias pero tengo otra consulta"]) {
+      const compoundAcknowledgement = await runAgent({ agent: "support", input: { ticketMessage } });
+      assert.notEqual(compoundAcknowledgement.model, "deterministic-acknowledgement");
+      assert.notEqual(compoundAcknowledgement.provider, "internal");
+    }
+
     const withRag = await runAgent({ agent: "support", input: { ticketMessage: "Hola, necesito información adicional." }, ragContext: { items: [{ content: "Referencia sintética.", sourceId: "fixture", score: 1 }] } });
     assert.notEqual(withRag.model, "deterministic-greeting");
 
     const withToolResult = await runAgent({ agent: "support", input: { ticketMessage: "Hola, necesito información adicional." }, toolResult: { toolCallId: "call_1", toolName: "consultar_disponibilidad", status: "SUCCEEDED", output: {} } });
     assert.notEqual(withToolResult.model, "deterministic-greeting");
+    const acknowledgementWithToolResult = await runAgent({ agent: "support", input: { ticketMessage: "gracias" }, toolResult: { toolCallId: "call_2", toolName: "consultar_disponibilidad", status: "SUCCEEDED", output: {} } });
+    assert.notEqual(acknowledgementWithToolResult.model, "deterministic-acknowledgement");
   } finally {
     globalThis.fetch = originalAgentFetch;
   }
 
   assert.equal(runSchema.parse({ agent: "lead", input: {}, mode: "standard" }).mode, "standard");
+  assert.equal(runSchema.parse({ agent: "support", input: {}, responseLanguage: "es" }).responseLanguage, "es");
+  assert.equal(runSchema.parse({ agent: "support", input: {} }).responseLanguage, "und");
+  assert.equal(runSchema.safeParse({ agent: "support", input: {}, responseLanguage: "fr" }).success, false);
+  assert.equal(responseLanguageSchema.safeParse("invalid").success, false);
+  assert.match(buildResponseLanguageDirective("es") ?? "", /Spanish \(es\)/);
+  assert.match(buildResponseLanguageDirective("en") ?? "", /English \(en\)/);
+  assert.equal(buildResponseLanguageDirective("und"), undefined);
+  assert.deepEqual(applyResponseLanguageDirective([{ role: "user", content: "ok" }], "und"), [{ role: "user", content: "ok" }]);
+  assert.match(applyResponseLanguageDirective([{ role: "system", content: "domain" }], "es")[0]?.content ?? "", /PRESENTATION ONLY/);
+  const languageRepairRequests: Array<Record<string, unknown>> = [];
+  const originalLanguageRepairFetch = globalThis.fetch;
+  try {
+    globalThis.fetch = async (_input, init) => {
+      const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      languageRepairRequests.push(body);
+      const content = languageRepairRequests.length === 1 ? "not json" : JSON.stringify(validSupportOutput);
+      return response({ model: "m", choices: [{ message: { content }, finish_reason: "stop" }] });
+    };
+    const result = await runAgent({
+      agent: "support",
+      input: { ticketMessage: "Necesito ayuda general con mi cuenta y servicio." },
+      responseLanguage: "es",
+    });
+    assert.equal(result.repairAttempt, true);
+    assert.equal(languageRepairRequests.length, 2);
+    for (const request of languageRepairRequests) {
+      const messages = request.messages as Array<{ role: string; content: string }>;
+      const directive = messages.find((message) => message.role === "system" && message.content.includes("RESPONSE LANGUAGE"));
+      assert.match(directive?.content ?? "", /Spanish \(es\)/);
+      assert.match(directive?.content ?? "", /must not alter tool selection, tool arguments, trusted business data, or authorization/);
+    }
+  } finally {
+    globalThis.fetch = originalLanguageRepairFetch;
+  }
   const validProgressionEvidence = {
     executionId: "00000000-0000-4000-8000-000000000001",
     targetTool: "booking_create",
@@ -797,6 +888,20 @@ const main = async () => {
   for (const nonPriceRequest of ["vale, gracias", "ok vale", "valoramos mucho el servicio", "hablemos del valor de la amistad", "gracias por la ayuda"]) {
     assert.deepEqual(resolveToolSelectionPolicy({ ticketMessage: nonPriceRequest }, bookingRoutingTools), { mustUseTool: false, compatibleToolNames: [] });
   }
+  for (const availabilityRequest of [
+    "tienes hora para mañana?",
+    "¿Tienes hora mañana?",
+    "tiene hora para mañana",
+    "¿tienen horas disponibles mañana?",
+    "¡TIENEN HORAS PARA MAÑANA!"
+  ]) expectedRoutingPolicy(availabilityRequest, "booking_check_availability");
+  const naturalAvailabilityPolicy = resolveToolSelectionPolicy({ ticketMessage: "tienes hora para mañana?" }, bookingRoutingTools);
+  const naturalAvailabilitySchema = buildToolSelectionResponseSchema(bookingRoutingTools, naturalAvailabilityPolicy);
+  assert.deepEqual(naturalAvailabilitySchema.properties.tool?.enum, ["booking_check_availability"]);
+  assert.equal(naturalAvailabilitySchema.properties.tool?.enum.includes("service_list"), false);
+  for (const nonAvailabilityRequest of ["¿Cuánto dura el corte clásico?", "¿A qué hora abren?", "¿Cuál es el horario de atención?"]) {
+    assert.deepEqual(resolveToolSelectionPolicy({ ticketMessage: nonAvailabilityRequest }, bookingRoutingTools), { mustUseTool: false, compatibleToolNames: [] });
+  }
   expectedRoutingPolicy("¿Hay hora con Rodrigo mañana a las 15:00?", "booking_check_availability");
   expectedRoutingPolicy("Quiero cancelar mi reserva.", "booking_cancel");
   expectedRoutingPolicy("Quiero ver mi reserva.", "booking_get");
@@ -1042,6 +1147,33 @@ const main = async () => {
   const extractionSchema = buildExtractionSchema(mixedReferenceTool.inputSchema);
   assert.deepEqual(Object.keys(extractionSchema.properties!), ["date", "serviceRef", "resourceRef"]);
   assert.equal(JSON.stringify(mixedReferenceTool.inputSchema), originalMixedSchema);
+  const naturalAvailabilityRequests: Record<string, unknown>[] = [];
+  const originalNaturalAvailabilityFetch = globalThis.fetch;
+  try {
+    globalThis.fetch = async (_input, init) => {
+      naturalAvailabilityRequests.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+      const content = naturalAvailabilityRequests.length === 1
+        ? '{"decision":"USE_TOOL","tool":"booking_check_availability"}'
+        : '{"date":"tomorrow","resourceRef":"unsupported candidate"}';
+      return response({ model: "m", choices: [{ message: { content }, finish_reason: "stop" }] });
+    };
+    const naturalAvailabilityResult = await runAgent({
+      agent: "support",
+      input: { ticketMessage: "tienes hora para mañana?" },
+      responseLanguage: "es",
+      tools: [bookingRoutingTools[0]!, mixedReferenceTool],
+      temporalContext: { currentDate: "2026-09-22", timezone: "America/Santiago" }
+    });
+    assert.equal(naturalAvailabilityRequests.length, 2);
+    assert.equal(naturalAvailabilityResult.orchestration?.action, "CALL_TOOL");
+    assert.equal(naturalAvailabilityResult.orchestration?.toolCall.toolName, "booking_check_availability");
+    assert.deepEqual(naturalAvailabilityResult.orchestration?.toolCall.arguments, { date: "2026-09-23" });
+    assert.equal(Object.hasOwn(naturalAvailabilityResult.orchestration?.toolCall.arguments ?? {}, "serviceRef"), false);
+    assert.equal(Object.hasOwn(naturalAvailabilityResult.orchestration?.toolCall.arguments ?? {}, "resourceRef"), false);
+    assert.doesNotMatch(JSON.stringify(naturalAvailabilityRequests), /RESPONSE LANGUAGE|responseLanguage/);
+  } finally {
+    globalThis.fetch = originalNaturalAvailabilityFetch;
+  }
   const extractionDefinition = { ...mixedReferenceTool, inputSchema: extractionSchema };
   for (const invalid of [
     { date: "2026-09-03", serviceId: "Corte clásico" },
@@ -1378,7 +1510,7 @@ const main = async () => {
     globalThis.fetch = originalUnsafeFollowUpFetch;
   }
   assert.throws(() => leadInputSchema.parse({ leadMessage: "x" }));
-  assert.throws(() => supportInputSchema.parse({ ticketMessage: "x" }));
+  assert.throws(() => supportInputSchema.parse({ ticketMessage: "" }));
   assert.equal(leadOutputSchema.parse({ summary: "s", detected_service: "CRM", lead_temperature: "warm", missing_information: [], suggested_next_action: "a", reply_to_client: "r", is_in_scope: true, out_of_scope_reason: null, safe_reply: "s" }).detected_service, "CRM");
   assert.equal(leadOutputSchema.parse({ summary: "s", detected_service: UNKNOWN_DETECTED_SERVICE, lead_temperature: "cold", missing_information: ["servicio"], suggested_next_action: "a", reply_to_client: "r", is_in_scope: true, out_of_scope_reason: null, safe_reply: "s" }).detected_service, "unknown");
   assert.throws(() => leadOutputSchema.parse({ summary: "s", detected_service: "", lead_temperature: "cold", missing_information: [], suggested_next_action: "a", reply_to_client: "r", is_in_scope: true, out_of_scope_reason: null, safe_reply: "s" }));

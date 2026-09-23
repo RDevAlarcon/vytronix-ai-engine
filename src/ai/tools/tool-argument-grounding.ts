@@ -37,6 +37,7 @@ const hasTimeEvidence = (text: string): boolean => /\b(?:[01]?\d|2[0-3]):[0-5]\d
 export const groundToolArguments = (input: unknown, tool: ToolDefinition, argumentsValue: Record<string, unknown>, temporalContext?: TemporalContext): ToolArgumentGroundingResult => {
   const text = inputText(input);
   const temporalEvidence = currentTurnText(input);
+  const currentTurnEvidence = temporalEvidence.toLocaleLowerCase("es");
   const grounded = { ...argumentsValue };
   const missing: string[] = [];
   const ungrounded: string[] = [];
@@ -61,8 +62,16 @@ export const groundToolArguments = (input: unknown, tool: ToolDefinition, argume
     }
     if (field === "time") {
       if (!hasTimeEvidence(text)) { missing.push(field); ungrounded.push(field); continue; }
-    } else if (typeof grounded[field] === "string" && !text.includes(String(grounded[field]).toLocaleLowerCase("es"))) {
-      ungrounded.push(field);
+    } else if (typeof grounded[field] === "string") {
+      const referenceField = property?.type === "string" && field.endsWith("Ref");
+      const evidence = referenceField ? currentTurnEvidence : text;
+      if (!evidence.includes(String(grounded[field]).toLocaleLowerCase("es"))) {
+        if (referenceField && !required.includes(field)) {
+          delete grounded[field];
+          continue;
+        }
+        ungrounded.push(field);
+      }
     }
   }
   return { status: missing.length ? "MISSING_INFORMATION" : ungrounded.length ? "UNGROUNDED" : "READY", arguments: grounded, missing, ungrounded };

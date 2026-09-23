@@ -9,6 +9,7 @@ import { assertRequestBodySize } from "@/lib/request-limits";
 import { ragContextSchema } from "@/ai/rag/rag-context";
 import { progressionEvidenceSchema, toolResultSchema, toolsSchema } from "@/ai/tools/tool-contract";
 import { temporalContextSchema } from "@/ai/tools/tool-temporal-context";
+import { responseLanguageSchema } from "@/ai/agents/response-language";
 
 export const runtime = "nodejs";
 
@@ -16,6 +17,7 @@ export const runSchema = z.object({
   agent: z.enum(["lead", "landing", "proposal", "support"]),
   input: z.unknown(),
   mode: z.enum(["standard", "fast"]).default("standard"),
+  responseLanguage: responseLanguageSchema.default("und"),
   ragContext: ragContextSchema.optional(),
   tools: toolsSchema.optional(),
   toolResult: toolResultSchema.optional(),

@@ -117,7 +117,16 @@ const DYNAMIC_SEMANTIC_GROUPS: DynamicSemanticGroup[] = [
   },
   {
     kind: "AVAILABILITY",
-    requestSignals: ["disponibilidad", "disponible", "availability", "slot", "cupo", "hay hora", "horario"],
+    requestSignals: ["disponibilidad", "disponible", "availability", "slot", "cupo", "hay hora"],
+    // Spanish scheduling questions commonly use tener + hora(s). Keep the
+    // pattern phrase-bound, and replace the former bare "horario" signal with
+    // availability-shaped phrases so business-hours questions stay conversational.
+    requestPatterns: [
+      /\b(?:tienes|tiene|tienen)\s+horas?\b(?!\s+de\s+atencion\b)/u,
+      /\bque\s+horarios?\s+(?:tienes|tiene|tienen)\b/u,
+      /\bhay\s+(?:un\s+)?horario\b/u,
+      /\bhorarios?\s+disponibles?\b/u
+    ],
     capabilitySignalTiers: [
       ["check availability", "time availability", "appointment slot", "horarios disponibles"],
       ["disponibilidad", "availability", "slot", "schedule", "horario"]
